@@ -23,7 +23,15 @@ interface MediaState {
   totalSpaceSavedBytes: number;
   lastAction: ActionHistory | null;
   
+  // Ephemeral State
+  allAssets: MediaLibrary.Asset[];
+  isFetchingMedia: boolean;
+  mediaFetchProgress: { loaded: number; total: number };
+  
   // Actions
+  setAllAssets: (assets: MediaLibrary.Asset[]) => void;
+  setFetchingMedia: (isFetching: boolean) => void;
+  setMediaFetchProgress: (loaded: number, total: number) => void;
   keepItem: (asset: PendingAsset) => void;
   markForDeletion: (asset: PendingAsset) => void;
   undoLastAction: () => void;
@@ -40,6 +48,13 @@ export const useMediaStore = create<MediaState>()(
       pendingDeletion: [],
       totalSpaceSavedBytes: 0,
       lastAction: null,
+      allAssets: [],
+      isFetchingMedia: false,
+      mediaFetchProgress: { loaded: 0, total: 0 },
+
+      setAllAssets: (assets) => set({ allAssets: assets }),
+      setFetchingMedia: (isFetching) => set({ isFetchingMedia: isFetching }),
+      setMediaFetchProgress: (loaded, total) => set({ mediaFetchProgress: { loaded, total } }),
 
       keepItem: (asset) => set((state) => ({
         keptItems: { ...state.keptItems, [asset.id]: true },
@@ -110,6 +125,12 @@ export const useMediaStore = create<MediaState>()(
     {
       name: 'memory-flick-storage',
       storage: createJSONStorage(() => AsyncStorage),
+      partialize: (state) => ({
+        keptItems: state.keptItems,
+        pendingDeletion: state.pendingDeletion,
+        totalSpaceSavedBytes: state.totalSpaceSavedBytes,
+        lastAction: state.lastAction,
+      }),
     }
   )
 );

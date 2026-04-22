@@ -1,5 +1,8 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Animated, PanResponder, Dimensions, ActivityIndicator } from 'react-native';
+import {
+  View, Text, StyleSheet, TouchableOpacity, Animated,
+  PanResponder, Dimensions, ActivityIndicator, FlatList, Modal, Pressable,
+} from 'react-native';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -7,298 +10,353 @@ import { Image } from 'expo-image';
 import { useVideoPlayer, VideoView } from 'expo-video';
 
 import { RootStackParamList } from '../navigation/types';
-import { fetchAllMedia, groupAssetsByMonth } from '../utils/mediaLibrary';
+import { groupAssetsByMonth } from '../utils/mediaLibrary';
 import { useMediaStore, PendingAsset } from '../store/useMediaStore';
 import * as MediaLibrary from 'expo-media-library';
 
-const SCREEN_WIDTH = Dimensions.get('window').width;
+const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const SWIPE_THRESHOLD = 120;
+const CARD_W = SCREEN_WIDTH - 48;   // 24 margin each side
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Swipe'>;
 
+/* ── Video sub-component ── */
 const VideoCard = ({ uri }: { uri: string }) => {
-  const player = useVideoPlayer(uri, player => {
-    player.loop = true;
-    player.play();
-  });
-  return (
-    <VideoView player={player} style={styles.cardImage} contentFit="cover" />
-  );
+  const player = useVideoPlayer(uri, p => { p.loop = true; p.play(); });
+  return <VideoView player={player} style={StyleSheet.absoluteFill} contentFit="cover" />;
 };
 
 export default function SwipeScreen({ route, navigation }: Props) {
   const { monthKey, filter } = route.params;
   const insets = useSafeAreaInsets();
-  
+
   const [assets, setAssets] = useState<MediaLibrary.Asset[]>([]);
   const [loading, setLoading] = useState(true);
   const [currentIndex, setCurrentIndex] = useState(0);
-  const [sortBySize, setSortBySize] = useState(false);
+  const [sortBySize, setSortBySize] = useState(true);
+  const [hideReviewed, setHideReviewed] = useState(false);
+  const [sortDropdown, setSortDropdown] = useState(false);
 
-  const { keptItems, pendingDeletion, keepItem, markForDeletion, undoLastAction } = useMediaStore();
+  const flatListRef = useRef<FlatList>(null);
+  const prevFilter = useRef(filter);
+  const prevSort = useRef(sortBySize);
+  const prevHide = useRef(hideReviewed);
+  const hiddenIdsRef = useRef<Set<string>>(new Set());
 
+  const {
+    keptItems, pendingDeletion, keepItem,
+    markForDeletion, undoLastAction, allAssets, lastAction,
+  } = useMediaStore();
+
+  /* ── derive asset list ── */
   useEffect(() => {
-    const load = async () => {
-      const allAssets = await fetchAllMedia();
-      const groups = groupAssetsByMonth(allAssets);
-      let targetGroup = groups.find(g => g.key === monthKey)?.assets || [];
-      
-      if (filter === 'images') {
-        targetGroup = targetGroup.filter(a => a.mediaType === MediaLibrary.MediaType.photo);
-      } else if (filter === 'videos') {
-        targetGroup = targetGroup.filter(a => a.mediaType === MediaLibrary.MediaType.video);
-      }
+    const groups = groupAssetsByMonth(allAssets);
+    let list = groups.find(g => g.key === monthKey)?.assets || [];
 
-      // Instead of filtering out processed items, we keep them to show in the carousel
-      if (sortBySize) {
-        // Mock data width/height used as rough proxy for size, or duration if video
-        targetGroup.sort((a, b) => (b.width * b.height) - (a.width * a.height));
-      }
+    if (filter === 'images') list = list.filter(a => a.mediaType === MediaLibrary.MediaType.photo);
+    else if (filter === 'videos') list = list.filter(a => a.mediaType === MediaLibrary.MediaType.video);
+    if (hideReviewed) list = list.filter(a => !hiddenIdsRef.current.has(a.id));
+    if (sortBySize) list = [...list].sort((a, b) => (b.width * b.height) - (a.width * a.height));
 
-      setAssets(targetGroup);
-      setLoading(false);
-    };
-    load();
-  }, [monthKey, filter, sortBySize]);
+    setAssets(list);
+    if (
+      prevFilter.current !== filter ||
+      prevSort.current !== sortBySize ||
+      prevHide.current !== hideReviewed
+    ) {
+      setCurrentIndex(0);
+      prevFilter.current = filter;
+      prevSort.current = sortBySize;
+      prevHide.current = hideReviewed;
+    }
+    setLoading(false);
+  }, [allAssets, monthKey, filter, sortBySize, hideReviewed]);
 
-  const currentAssetRef = useRef<number>(0);
+  /* ── auto-scroll carousel ── */
   useEffect(() => {
-    currentAssetRef.current = currentIndex;
-  }, [currentIndex]);
+    if (assets.length > 0 && currentIndex < assets.length && flatListRef.current) {
+      flatListRef.current.scrollToIndex({
+        index: currentIndex, animated: true, viewPosition: 0.5,
+      });
+    }
+  }, [currentIndex, assets.length]);
 
-  // Use Ref to always have the latest assets array in panResponder handlers
+  /* ── keep refs fresh for pan handler ── */
+  const currentIndexRef = useRef(0);
+  useEffect(() => { currentIndexRef.current = currentIndex; }, [currentIndex]);
   const assetsRef = useRef(assets);
-  useEffect(() => {
-    assetsRef.current = assets;
-  }, [assets]);
+  useEffect(() => { assetsRef.current = assets; }, [assets]);
 
-  const position = useRef(new Animated.ValueXY()).current;
-  const [isSwiping, setIsSwiping] = useState(false);
-
-  // Automatically redirect when done
+  /* ── auto-redirect when done ── */
   useEffect(() => {
     if (!loading && assets.length > 0 && currentIndex >= assets.length) {
-      if (pendingDeletion.length > 0) {
-        navigation.replace('Trash');
-      } else {
-        navigation.goBack();
-      }
+      if (pendingDeletion.length > 0) navigation.replace('Trash', { monthKey });
+      else navigation.goBack();
     }
   }, [loading, assets.length, currentIndex, pendingDeletion.length, navigation]);
 
-  // We should recreate panResponder only once, reading from refs
-  const panResponder = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onPanResponderMove: (event, gesture) => {
-        setIsSwiping(true);
-        position.setValue({ x: gesture.dx, y: gesture.dy });
-      },
-      onPanResponderRelease: (event, gesture) => {
-        setIsSwiping(false);
-        if (gesture.dx > SWIPE_THRESHOLD) {
-          forceSwipe('right');
-        } else if (gesture.dx < -SWIPE_THRESHOLD) {
-          forceSwipe('left');
-        } else {
-          resetPosition();
-        }
-      }
-    })
-  ).current;
+  /* ── swipe animation ── */
+  const position = useRef(new Animated.ValueXY()).current;
 
   const forceSwipe = (direction: 'right' | 'left') => {
     const x = direction === 'right' ? SCREEN_WIDTH + 100 : -SCREEN_WIDTH - 100;
-    Animated.timing(position, {
-      toValue: { x, y: 0 },
-      duration: 250,
-      useNativeDriver: false
-    }).start(() => onSwipeComplete(direction));
+    Animated.timing(position, { toValue: { x, y: 0 }, duration: 250, useNativeDriver: false })
+      .start(() => onSwipeComplete(direction));
   };
 
   const resetPosition = () => {
-    Animated.spring(position, {
-      toValue: { x: 0, y: 0 },
-      friction: 5,
-      useNativeDriver: false
-    }).start();
+    Animated.spring(position, { toValue: { x: 0, y: 0 }, friction: 5, useNativeDriver: false }).start();
   };
 
   const onSwipeComplete = (direction: 'right' | 'left') => {
-    const latestAssets = assetsRef.current;
-    if (latestAssets.length === 0 || currentAssetRef.current >= latestAssets.length) return;
-    
-    const item = latestAssets[currentAssetRef.current]; 
+    const list = assetsRef.current;
+    const idx = currentIndexRef.current;
+    if (!list.length || idx >= list.length) return;
+    const item = list[idx];
     if (!item) return;
-
-    const pendingAsset: PendingAsset = {
-      id: item.id,
-      uri: item.uri,
-      mediaType: item.mediaType,
-      width: item.width,
-      height: item.height,
-      duration: item.duration
-    };
-
-    if (direction === 'right') {
-      keepItem(pendingAsset);
-    } else {
-      markForDeletion(pendingAsset);
-    }
-    
+    const pa: PendingAsset = { id: item.id, uri: item.uri, mediaType: item.mediaType, width: item.width, height: item.height, duration: item.duration };
+    if (direction === 'right') keepItem(pa); else markForDeletion(pa);
     position.setValue({ x: 0, y: 0 });
-    setCurrentIndex(prev => prev + 1);
+    setCurrentIndex(p => p + 1);
   };
+
+  const panResponder = useRef(PanResponder.create({
+    onStartShouldSetPanResponder: () => true,
+    onPanResponderMove: (_, g) => { position.setValue({ x: g.dx, y: g.dy }); },
+    onPanResponderRelease: (_, g) => {
+      if (g.dx > SWIPE_THRESHOLD) forceSwipe('right');
+      else if (g.dx < -SWIPE_THRESHOLD) forceSwipe('left');
+      else resetPosition();
+    },
+  })).current;
 
   const getCardStyle = () => {
     const rotate = position.x.interpolate({
       inputRange: [-SCREEN_WIDTH / 2, 0, SCREEN_WIDTH / 2],
       outputRange: ['-15deg', '0deg', '15deg'],
-      extrapolate: 'clamp'
+      extrapolate: 'clamp',
     });
-
-    return {
-      transform: [
-        { translateX: position.x },
-        { translateY: position.y },
-        { rotate }
-      ]
-    };
+    return { transform: [{ translateX: position.x }, { translateY: position.y }, { rotate }] };
   };
 
-  const renderTopTags = () => {
-    const likeOpacity = position.x.interpolate({ inputRange: [0, 50], outputRange: [0, 1], extrapolate: 'clamp' });
-    const deleteOpacity = position.x.interpolate({ inputRange: [-50, 0], outputRange: [1, 0], extrapolate: 'clamp' });
-
+  /* ── KEEP / TRASH overlay stickers ── */
+  const renderStickers = () => {
+    const keepOp = position.x.interpolate({ inputRange: [0, 60], outputRange: [0, 1], extrapolate: 'clamp' });
+    const trashOp = position.x.interpolate({ inputRange: [-60, 0], outputRange: [1, 0], extrapolate: 'clamp' });
     return (
-      <View style={styles.tagWrapper}>
-        <Animated.View style={[styles.likeTag, { opacity: likeOpacity, alignSelf: 'flex-start', transform: [{rotate: '-15deg'}] }]}>
-          <Text style={styles.likeText}>KEEP</Text>
+      <>
+        <Animated.View style={[styles.stickerKeep, { opacity: keepOp }]}>
+          <Text style={styles.stickerText}>KEEP</Text>
         </Animated.View>
-        <Animated.View style={[styles.deleteTag, { opacity: deleteOpacity, alignSelf: 'flex-end', transform: [{rotate: '15deg'}] }]}>
-          <Text style={styles.deleteText}>TRASH</Text>
+        <Animated.View style={[styles.stickerTrash, { opacity: trashOp }]}>
+          <Text style={styles.stickerText}>TRASH</Text>
         </Animated.View>
-      </View>
+      </>
     );
   };
 
-  const renderMedia = (asset: MediaLibrary.Asset, isActive: boolean) => {
+  const renderMedia = (asset: MediaLibrary.Asset, active: boolean) => {
     if (asset.mediaType === MediaLibrary.MediaType.video) {
-      if (!isActive) {
-        return (
-          <View style={styles.cardEmpty}>
-              <Ionicons name="videocam-outline" size={64} color="#94a3b8" />
-              <Text style={{color: '#94a3b8', marginTop: 10}}>Video Ready</Text>
-          </View>
-        );
-      }
+      if (!active) return (
+        <View style={styles.videoPlaceholder}>
+          <Ionicons name="videocam-outline" size={56} color="#475569" />
+          <Text style={styles.videoPlaceholderText}>Video</Text>
+        </View>
+      );
       return <VideoCard uri={asset.uri} />;
     }
-    
+    return <Image source={asset.uri} style={StyleSheet.absoluteFill} contentFit="cover" transition={200} />;
+  };
+
+  /* ── toggle hide reviewed ── */
+  const toggleHideReviewed = () => {
+    const next = !hideReviewed;
+    if (next) {
+      const s = new Set<string>();
+      Object.keys(keptItems).forEach(id => s.add(id));
+      pendingDeletion.forEach(p => s.add(p.id));
+      hiddenIdsRef.current = s;
+    } else {
+      hiddenIdsRef.current = new Set();
+    }
+    setHideReviewed(next);
+  };
+
+  const handleUndo = () => {
+    if (!lastAction) return;
+    undoLastAction();
+    if (currentIndex > 0) setCurrentIndex(p => p - 1);
+  };
+
+  /* ── carousel item ── */
+  const renderCarouselItem = ({ item, index: i }: { item: MediaLibrary.Asset; index: number }) => {
+    const isCurrent = i === currentIndex;
+    const isKept = !!keptItems[item.id];
+    const isTrashed = pendingDeletion.some(p => p.id === item.id);
+    const isVideo = item.mediaType === MediaLibrary.MediaType.video;
+
     return (
-      <Image
-        source={asset.uri}
-        style={styles.cardImage}
-        contentFit="cover"
-        transition={200}
-      />
+      <TouchableOpacity
+        onPress={() => setCurrentIndex(i)}
+        activeOpacity={0.8}
+        style={[styles.carouselItem, isCurrent && styles.carouselItemActive, (isKept || isTrashed) && { opacity: 0.65 }]}
+      >
+        <Image source={item.uri} style={StyleSheet.absoluteFill} contentFit="cover" />
+
+        {/* Status badge */}
+        {isTrashed && (
+          <View style={[styles.carouselBadge, { backgroundColor: '#F87171' }]}>
+            <Ionicons name="trash-outline" size={9} color="#0F172A" />
+          </View>
+        )}
+        {isKept && !isTrashed && (
+          <View style={[styles.carouselBadge, { backgroundColor: '#4ADE80' }]}>
+            <Ionicons name="checkmark" size={9} color="#0F172A" />
+          </View>
+        )}
+        {isVideo && !isKept && !isTrashed && (
+          <View style={[styles.carouselBadge, { backgroundColor: '#A78BFA' }]}>
+            <Ionicons name="play" size={9} color="#0F172A" />
+          </View>
+        )}
+      </TouchableOpacity>
     );
   };
 
-
-
+  /* ── loading / empty ── */
   if (loading || (assets.length === 0 && !loading)) {
     return (
-      <View style={[styles.container, { justifyContent: 'center' }]}>
-        <ActivityIndicator size="large" color="#a855f7" />
+      <View style={[styles.container, { justifyContent: 'center', alignItems: 'center' }]}>
+        <ActivityIndicator size="large" color="#0F172A" />
       </View>
     );
   }
 
+  const currentAsset = assets[currentIndex];
+  const fileSizeLabel = currentAsset
+    ? (() => {
+        const px = (currentAsset.width || 0) * (currentAsset.height || 0);
+        const mb = px / (3 * 1024 * 1024);
+        return mb > 0 ? `~${mb.toFixed(1)} MB` : null;
+      })()
+    : null;
+
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
+
+      {/* ── HEADER ── */}
       <View style={styles.header}>
-        <TouchableOpacity style={styles.iconButton} onPress={() => navigation.goBack()}>
-          <Ionicons name="chevron-down" size={28} color="#f8fafc" />
-        </TouchableOpacity>
-        
-        <TouchableOpacity style={styles.iconButton} onPress={() => setSortBySize(!sortBySize)}>
-          <Ionicons name={sortBySize ? "funnel" : "funnel-outline"} size={20} color={sortBySize ? "#a855f7" : "#f8fafc"} />
-          <Text style={{color: sortBySize ? "#a855f7" : "#f8fafc", fontSize: 10, marginTop: 2}}>Size</Text>
+        <TouchableOpacity style={styles.iconBtn} onPress={() => navigation.goBack()}>
+          <Ionicons name="chevron-back" size={22} color="#0F172A" />
         </TouchableOpacity>
 
-        <View style={{alignItems: 'center'}}>
-          <Text style={styles.headerTitle}>{monthKey}</Text>
-          {sortBySize && <Text style={{color: '#a855f7', fontSize: 11, fontWeight: 'bold'}}>Largest First</Text>}
-        </View>
+        <Text style={styles.headerTitle} numberOfLines={1}>{monthKey}</Text>
 
-        <TouchableOpacity style={styles.iconButton} onPress={() => undoLastAction()}>
-          <Ionicons name="arrow-undo-outline" size={24} color="#f8fafc" />
+        <TouchableOpacity
+          style={[styles.iconBtn, { backgroundColor: '#FDE047' }]}
+          onPress={handleUndo}
+          disabled={!lastAction}
+        >
+          <Ionicons name="arrow-undo" size={20} color="#0F172A" style={{ opacity: lastAction ? 1 : 0.3 }} />
         </TouchableOpacity>
       </View>
 
-      {/* Up Next Carousel */}
-      <View style={styles.carouselContainer}>
-        <Animated.ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{gap: 8, paddingHorizontal: 20}}>
-          {assets.map((asset, i) => {
-            const isCurrent = i === currentIndex;
-            const isKept = !!keptItems[asset.id];
-            const isTrashed = pendingDeletion.some(p => p.id === asset.id);
+      {/* ── CONTROL BAR (Sort + Filter) ── */}
+      <View style={styles.controlBar}>
+        {/* Sort pill with dropdown */}
+        <TouchableOpacity style={styles.controlPill} onPress={() => setSortDropdown(v => !v)}>
+          <Ionicons name="funnel-outline" size={13} color="#FDE047" />
+          <Text style={styles.controlPillText}>{sortBySize ? 'Biggest First' : 'By Date'}</Text>
+          <Ionicons name="chevron-down" size={13} color="#FDE047" />
+        </TouchableOpacity>
 
-            return (
-              <TouchableOpacity key={asset.id} onPress={() => setCurrentIndex(i)} style={{alignItems: 'center'}}>
-                <View>
-                  <Image 
-                    source={asset.uri} 
-                    style={[
-                      styles.carouselImage, 
-                      isCurrent && styles.carouselImageActive,
-                      isKept && {borderColor: '#4ade80'},
-                      isTrashed && {borderColor: '#ef4444'}
-                    ]} 
-                    contentFit="cover" 
-                  />
-                  {isKept && <Ionicons name="heart" size={16} color="#4ade80" style={{position: 'absolute', bottom: -5, right: -5}} />}
-                  {isTrashed && <Ionicons name="close-circle" size={16} color="#ef4444" style={{position: 'absolute', bottom: -5, right: -5}} />}
-                </View>
+        {/* Show/hide reviewed */}
+        <TouchableOpacity
+          style={[styles.controlPill, styles.controlPillLight, hideReviewed && styles.controlPillLightActive]}
+          onPress={toggleHideReviewed}
+        >
+          <Ionicons name={hideReviewed ? 'eye-off-outline' : 'eye-outline'} size={13} color="#0F172A" />
+          <Text style={styles.controlPillTextDark}>{hideReviewed ? 'Hide Reviewed' : 'Show All'}</Text>
+          <Ionicons name="chevron-down" size={13} color="#0F172A" />
+        </TouchableOpacity>
+      </View>
+
+      {/* ── SORT DROPDOWN MODAL ── */}
+      <Modal transparent visible={sortDropdown} onRequestClose={() => setSortDropdown(false)} animationType="fade">
+        <Pressable style={styles.modalOverlay} onPress={() => setSortDropdown(false)}>
+          <View style={styles.dropdown}>
+            {(['Biggest First', 'By Date'] as const).map(opt => (
+              <TouchableOpacity
+                key={opt}
+                style={[styles.dropdownItem, sortBySize === (opt === 'Biggest First') && styles.dropdownItemActive]}
+                onPress={() => { setSortBySize(opt === 'Biggest First'); setSortDropdown(false); }}
+              >
+                <Text style={[styles.dropdownText, sortBySize === (opt === 'Biggest First') && styles.dropdownTextActive]}>
+                  {opt}
+                </Text>
+                {sortBySize === (opt === 'Biggest First') && <Ionicons name="checkmark" size={16} color="#0F172A" />}
               </TouchableOpacity>
-            );
-          })}
-        </Animated.ScrollView>
-      </View>
+            ))}
+          </View>
+        </Pressable>
+      </Modal>
 
+      {/* ── CARD STACK ── */}
       <View style={styles.cardContainer}>
         {assets.map((asset, index) => {
           if (index < currentIndex || index > currentIndex + 1) return null;
-
           if (index === currentIndex) {
             return (
-              <Animated.View
-                key={asset.id}
-                style={[styles.card, getCardStyle()]}
-                {...panResponder.panHandlers}
-              >
+              <Animated.View key={asset.id} style={[styles.card, getCardStyle()]} {...panResponder.panHandlers}>
                 {renderMedia(asset, true)}
-                {renderTopTags()}
+                {renderStickers()}
+                {fileSizeLabel && (
+                  <View style={styles.sizeChip}>
+                    <Text style={styles.sizeChipText}>{fileSizeLabel}</Text>
+                  </View>
+                )}
               </Animated.View>
             );
           }
-
-          // Next Card (Underneath)
           return (
-            <Animated.View key={asset.id} style={[styles.card, { transform: [{ scale: 0.95 }], top: 10, zIndex: -1 }]}>
-               {renderMedia(asset, false)}
+            <Animated.View key={asset.id} style={[styles.card, styles.cardBehind]}>
+              {renderMedia(asset, false)}
             </Animated.View>
           );
         }).reverse()}
       </View>
 
-      <View style={styles.actions}>
-        <TouchableOpacity style={[styles.actionBtn, { borderColor: '#ef4444' }]} onPress={() => forceSwipe('left')}>
-          <Ionicons name="close" size={32} color="#ef4444" />
+      {/* ── UP NEXT label + CAROUSEL ── */}
+      <View style={styles.carouselSection}>
+        <Text style={styles.carouselLabel}>
+          UP NEXT · {currentIndex + 1} / {assets.length}
+        </Text>
+        <FlatList
+          ref={flatListRef}
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          data={assets}
+          keyExtractor={item => item.id}
+          contentContainerStyle={{ paddingHorizontal: 16 }}
+          onScrollToIndexFailed={info => {
+            setTimeout(() => flatListRef.current?.scrollToIndex({ index: info.index, animated: true, viewPosition: 0.5 }), 500);
+          }}
+          renderItem={renderCarouselItem}
+        />
+      </View>
+
+      {/* ── ACTION BUTTONS ── */}
+      <View style={[styles.actions, { paddingBottom: Math.max(insets.bottom + 8, 24) }]}>
+        <TouchableOpacity style={[styles.actionBtn, styles.actionTrash]} onPress={() => forceSwipe('left')}>
+          <Ionicons name="trash-outline" size={28} color="#0F172A" />
         </TouchableOpacity>
-        <TouchableOpacity style={[styles.actionBtn, { borderColor: '#4ade80' }]} onPress={() => forceSwipe('right')}>
-          <Ionicons name="heart" size={32} color="#4ade80" />
+
+        <TouchableOpacity style={[styles.actionBtn, styles.actionSkip]} onPress={() => setCurrentIndex(p => Math.min(p + 1, assets.length - 1))}>
+          <Ionicons name="play-forward" size={22} color="#0F172A" />
+        </TouchableOpacity>
+
+        <TouchableOpacity style={[styles.actionBtn, styles.actionKeep]} onPress={() => forceSwipe('right')}>
+          <Ionicons name="heart-outline" size={30} color="#0F172A" />
         </TouchableOpacity>
       </View>
     </View>
@@ -306,145 +364,187 @@ export default function SwipeScreen({ route, navigation }: Props) {
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#0f172a',
-  },
+  container: { flex: 1, backgroundColor: '#A78BFA' },
+
+  /* Header */
   header: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 20,
-    paddingVertical: 10,
+    paddingHorizontal: 18,
+    paddingTop: 8,
+    paddingBottom: 4,
   },
-  iconButton: {
-    padding: 8,
-    backgroundColor: '#1e293b',
-    borderRadius: 20,
-  },
-  headerTitle: {
-    color: '#f8fafc',
-    fontSize: 18,
-    fontWeight: 'bold',
-  },
-  carouselContainer: {
-    flexDirection: 'row',
-    paddingHorizontal: 20,
-    marginVertical: 10,
-    gap: 8,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  carouselImage: {
-    width: 48,
-    height: 48,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#334155',
-  },
-  carouselImageActive: {
-    width: 56,
-    height: 56,
+  iconBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 12,
+    backgroundColor: '#FFFFFF',
     borderWidth: 3,
-    borderColor: '#a855f7',
-    shadowColor: '#a855f7',
-    shadowOffset: { width: 0, height: 0 },
-    shadowOpacity: 0.5,
-    shadowRadius: 10,
-  },
-  cardContainer: {
-    flex: 1,
-    alignItems: 'center',
+    borderColor: '#0F172A',
     justifyContent: 'center',
+    alignItems: 'center',
+    boxShadow: '3px 3px 0px 0px #0F172A',
   },
+  headerTitle: { fontSize: 20, fontWeight: '900', color: '#0F172A', flex: 1, textAlign: 'center', marginHorizontal: 8 },
+
+  /* Control bar */
+  controlBar: { flexDirection: 'row', justifyContent: 'center', gap: 8, paddingHorizontal: 18, paddingBottom: 8 },
+  controlPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    backgroundColor: '#0F172A',
+    borderRadius: 99,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  controlPillText: { color: '#FDE047', fontSize: 12, fontWeight: '800' },
+  controlPillLight: {
+    backgroundColor: '#FFFFFF',
+    borderWidth: 2,
+    borderColor: '#0F172A',
+    boxShadow: '2px 2px 0px 0px #0F172A',
+  },
+  controlPillLightActive: { backgroundColor: '#4ADE80' },
+  controlPillTextDark: { color: '#0F172A', fontSize: 12, fontWeight: '800' },
+
+  /* Dropdown */
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.3)' },
+  dropdown: {
+    position: 'absolute',
+    top: 130,
+    alignSelf: 'center',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    borderWidth: 3,
+    borderColor: '#0F172A',
+    overflow: 'hidden',
+    boxShadow: '4px 4px 0px 0px #0F172A',
+    minWidth: 180,
+  },
+  dropdownItem: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 14 },
+  dropdownItemActive: { backgroundColor: '#FDE047' },
+  dropdownText: { fontSize: 14, fontWeight: '700', color: '#0F172A' },
+  dropdownTextActive: { fontWeight: '900' },
+
+  /* Card */
+  cardContainer: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   card: {
     position: 'absolute',
-    width: SCREEN_WIDTH * 0.85,
-    height: '90%',
-    backgroundColor: '#1e293b',
-    borderRadius: 24,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 10 },
-    shadowOpacity: 0.3,
-    shadowRadius: 20,
-    elevation: 8,
+    width: CARD_W,
+    height: '96%',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 22,
+    borderWidth: 4,
+    borderColor: '#0F172A',
     overflow: 'hidden',
-    justifyContent: 'center',
+    boxShadow: '8px 8px 0px 0px #0F172A',
   },
-  cardImage: {
-    width: '100%',
-    height: '100%',
+  cardBehind: {
+    transform: [{ scale: 0.95 }],
+    top: 12,
+    zIndex: -1,
+    shadowOffset: { width: 4, height: 4 },
   },
-  cardEmpty: {
-    flex: 1,
+  videoPlaceholder: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#E2E8F0' },
+  videoPlaceholderText: { color: '#475569', marginTop: 8, fontWeight: '700' },
+
+  /* Stickers */
+  stickerKeep: {
+    position: 'absolute',
+    top: 30,
+    left: -14,
+    backgroundColor: '#4ADE80',
+    borderWidth: 4,
+    borderColor: '#0F172A',
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderRadius: 10,
+    transform: [{ rotate: '-12deg' }],
+    boxShadow: '4px 4px 0px 0px #0F172A',
+  },
+  stickerTrash: {
+    position: 'absolute',
+    top: 30,
+    right: -14,
+    backgroundColor: '#F87171',
+    borderWidth: 4,
+    borderColor: '#0F172A',
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderRadius: 10,
+    transform: [{ rotate: '12deg' }],
+    boxShadow: '4px 4px 0px 0px #0F172A',
+  },
+  stickerText: { fontSize: 26, fontWeight: '900', color: '#0F172A', letterSpacing: 2 },
+
+  /* Size chip */
+  sizeChip: {
+    position: 'absolute',
+    bottom: 14,
+    left: 14,
+    backgroundColor: '#FDE047',
+    borderWidth: 2,
+    borderColor: '#0F172A',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+    boxShadow: '2px 2px 0px 0px #0F172A',
+  },
+  sizeChipText: { fontSize: 12, fontWeight: '800', color: '#0F172A' },
+
+  /* Carousel */
+  carouselSection: { gap: 6, paddingTop: 10, paddingBottom: 6 },
+  carouselLabel: { textAlign: 'center', fontSize: 12, fontWeight: '800', color: '#0F172A', letterSpacing: 0.5 },
+  carouselItem: {
+    width: 58,
+    height: 58,
+    borderRadius: 11,
+    borderWidth: 2.5,
+    borderColor: '#0F172A',
+    marginRight: 10,
+    overflow: 'hidden',
+    backgroundColor: '#E2E8F0',
+    position: 'relative',
+  },
+  carouselItemActive: {
+    width: 74,
+    height: 74,
+    borderWidth: 4,
+    borderColor: '#FDE047',
+    boxShadow: '4px 4px 0px 0px #0F172A',
+  },
+  carouselBadge: {
+    position: 'absolute',
+    bottom: -4,
+    right: -4,
+    width: 18,
+    height: 18,
+    borderRadius: 99,
+    borderWidth: 2,
+    borderColor: '#0F172A',
     justifyContent: 'center',
     alignItems: 'center',
-    backgroundColor: '#1e293b'
   },
-  tagWrapper: {
-    position: 'absolute',
-    top: 40,
-    left: 20,
-    right: 20,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    zIndex: 10,
-  },
-  likeTag: {
-    borderWidth: 4,
-    borderColor: '#4ade80',
-    borderRadius: 8,
-    padding: 8,
-    backgroundColor: 'rgba(74, 222, 128, 0.2)',
-  },
-  likeText: {
-    color: '#4ade80',
-    fontSize: 32,
-    fontWeight: '900',
-  },
-  deleteTag: {
-    borderWidth: 4,
-    borderColor: '#ef4444',
-    borderRadius: 8,
-    padding: 8,
-    backgroundColor: 'rgba(239, 68, 68, 0.2)',
-  },
-  deleteText: {
-    color: '#ef4444',
-    fontSize: 32,
-    fontWeight: '900',
-  },
+
+  /* Action buttons */
   actions: {
     flexDirection: 'row',
-    justifyContent: 'space-evenly',
-    paddingBottom: 40,
-    paddingTop: 20,
-  },
-  actionBtn: {
-    width: 72,
-    height: 72,
-    borderRadius: 36,
-    borderWidth: 2,
     justifyContent: 'center',
     alignItems: 'center',
-    backgroundColor: '#1e293b',
+    gap: 20,
+    paddingTop: 8,
   },
-  doneText: {
-    color: '#f8fafc',
-    fontSize: 24,
-    fontWeight: 'bold',
-    marginTop: 16,
-    marginBottom: 32,
-  },
-  backButton: {
-    paddingHorizontal: 24,
-    paddingVertical: 12,
-    backgroundColor: '#334155',
+  actionBtn: {
+    justifyContent: 'center',
+    alignItems: 'center',
     borderRadius: 99,
+    borderWidth: 4,
+    borderColor: '#0F172A',
+    boxShadow: '5px 5px 0px 0px #0F172A',
   },
-  backButtonText: {
-    color: '#f8fafc',
-    fontSize: 16,
-    fontWeight: 'bold',
-  },
+  actionTrash: { width: 68, height: 68, backgroundColor: '#F87171' },
+  actionSkip: { width: 50, height: 50, backgroundColor: '#FFFFFF' },
+  actionKeep: { width: 68, height: 68, backgroundColor: '#4ADE80' },
 });

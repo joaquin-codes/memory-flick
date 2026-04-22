@@ -8,7 +8,7 @@ export interface MonthGroup {
 
 export const requestMediaPermissions = async (): Promise<boolean> => {
   try {
-    const { status } = await MediaLibrary.requestPermissionsAsync(false, ['photo', 'video']);
+    const { status } = await MediaLibrary.requestPermissionsAsync();
     return status === 'granted';
   } catch (err) {
     console.warn("Permission API thrown: we will attempt fallback.", err);
@@ -16,7 +16,9 @@ export const requestMediaPermissions = async (): Promise<boolean> => {
   }
 };
 
-export const fetchAllMedia = async (): Promise<MediaLibrary.Asset[]> => {
+export const fetchAllMedia = async (
+  onProgress?: (assets: MediaLibrary.Asset[], hasNextPage: boolean, totalCount: number) => void
+): Promise<MediaLibrary.Asset[]> => {
   let allAssets: MediaLibrary.Asset[] = [];
   let hasNextPage = true;
   let endCursor: string | undefined = undefined;
@@ -26,7 +28,7 @@ export const fetchAllMedia = async (): Promise<MediaLibrary.Asset[]> => {
   try {
     while (hasNextPage && allAssets.length < 10000) {
       const response = await MediaLibrary.getAssetsAsync({
-        first: 1000,
+        first: 100,
         after: endCursor,
         sortBy: [[MediaLibrary.SortBy.creationTime, false]],
         mediaType: [MediaLibrary.MediaType.photo, MediaLibrary.MediaType.video],
@@ -39,6 +41,10 @@ export const fetchAllMedia = async (): Promise<MediaLibrary.Asset[]> => {
       allAssets = [...allAssets, ...response.assets];
       hasNextPage = response.hasNextPage;
       endCursor = response.endCursor;
+      
+      if (onProgress) {
+        onProgress(allAssets, hasNextPage, response.totalCount);
+      }
     }
   } catch (err) {
     console.warn('Expo Go rejected reading assets, using mock data.');

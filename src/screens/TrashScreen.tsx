@@ -1,5 +1,8 @@
 import React, { useState } from 'react';
-import { View, Text, StyleSheet, FlatList, TouchableOpacity, Alert, ActivityIndicator } from 'react-native';
+import {
+  View, Text, StyleSheet, FlatList, TouchableOpacity,
+  Alert, ActivityIndicator,
+} from 'react-native';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -16,197 +19,251 @@ export default function TrashScreen({ navigation }: Props) {
   const { pendingDeletion, confirmDeletion, incrementSpaceSaved, restoreItem } = useMediaStore();
   const [isDeleting, setIsDeleting] = useState(false);
 
-  const calculateTotalSize = async (assetIds: string[]): Promise<number> => {
-    let totalBytes = 0;
-    try {
-      for (const id of assetIds) {
-        const info = await MediaLibrary.getAssetInfoAsync(id);
-        // @ts-ignore: 'size' may not exist on type AssetInfo depending on expo version definitions
-        if (info && info.size) { 
-          // @ts-ignore
-          totalBytes += info.size;
-        } else {
-          totalBytes += 2 * 1024 * 1024; // Fallback 2MB
-        }
+  const estimateBytes = (assets: any[]): number => {
+    let total = 0;
+    for (const a of assets) {
+      if (a.mediaType === 'video') {
+        total += a.duration > 0 ? a.duration * 2 * 1024 * 1024 : 15 * 1024 * 1024;
+      } else {
+        total += a.width && a.height ? (a.width * a.height) / 3 : 3 * 1024 * 1024;
       }
-    } catch(e) {
-      console.warn("Failed to retrieve sizes", e);
     }
-    return totalBytes > 0 ? totalBytes : assetIds.length * 2048 * 1024;
+    return total;
   };
 
-  const handleConfirmDeletion = async () => {
-    if (pendingDeletion.length === 0) return;
+  const totalMB = (estimateBytes(pendingDeletion) / (1024 * 1024)).toFixed(1);
 
+  const handleDelete = async () => {
+    if (!pendingDeletion.length) return;
     Alert.alert(
-      "Confirm Deletion",
-      `Are you sure you want to permanently delete these ${pendingDeletion.length} items? This action cannot be undone.`,
+      'Delete Permanently?',
+      `${pendingDeletion.length} item${pendingDeletion.length !== 1 ? 's' : ''} will be removed forever. This cannot be undone.`,
       [
-        { text: "Cancel", style: "cancel" },
-        { 
-          text: "Delete", 
-          style: "destructive",
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
           onPress: async () => {
             setIsDeleting(true);
-            const assetIds = pendingDeletion.map(a => a.id);
-            
+            const ids = pendingDeletion.map(a => a.id);
             try {
-              // 1. Calculate space saved BEFORE deleting
-              const bytesSaved = await calculateTotalSize(assetIds);
-
-              // 2. Call Native Deletion Prompt
-              const success = await MediaLibrary.deleteAssetsAsync(assetIds);
-              
-              if (success) {
-                confirmDeletion(assetIds);
-                incrementSpaceSaved(bytesSaved);
-                Alert.alert("Success", `You have freed up ${(bytesSaved / (1024 * 1024)).toFixed(2)} MB!`);
+              const bytes = estimateBytes(pendingDeletion);
+              const ok = await MediaLibrary.deleteAssetsAsync(ids);
+              if (ok) {
+                confirmDeletion(ids);
+                incrementSpaceSaved(bytes);
+                Alert.alert('Done!', `Freed up ~${(bytes / (1024 * 1024)).toFixed(1)} MB.`);
                 navigation.goBack();
               }
-            } catch (err) {
-              console.error("Deletion error:", err);
-              Alert.alert("Error", "Could not delete assets. Please ensure you granted permission.");
+            } catch (e) {
+              console.error(e);
+              Alert.alert('Error', 'Could not delete assets. Check permissions.');
             } finally {
               setIsDeleting(false);
             }
-          }
-        }
+          },
+        },
       ]
     );
   };
 
   const renderItem = ({ item }: { item: any }) => (
     <View style={styles.gridItem}>
-      <Image
-        source={item.uri}
-        style={styles.thumbnail}
-        contentFit="cover"
-      />
-      <TouchableOpacity 
-        style={styles.restoreButton}
-        onPress={() => restoreItem(item.id)}
-      >
-        <Ionicons name="refresh-outline" size={20} color="#fff" />
+      <Image source={item.uri} style={StyleSheet.absoluteFill} contentFit="cover" />
+      {item.mediaType === 'video' && (
+        <View style={styles.videoIndicator}>
+          <Ionicons name="play" size={10} color="#0F172A" />
+        </View>
+      )}
+      <TouchableOpacity style={styles.restoreBtn} onPress={() => restoreItem(item.id)}>
+        <Ionicons name="refresh-outline" size={16} color="#0F172A" />
       </TouchableOpacity>
     </View>
   );
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
+
+      {/* ── Header ── */}
       <View style={styles.header}>
-        <TouchableOpacity style={styles.backButton} onPress={() => navigation.goBack()}>
-          <Ionicons name="arrow-back" size={24} color="#f8fafc" />
+        <TouchableOpacity style={styles.backBtn} onPress={() => navigation.goBack()}>
+          <Ionicons name="chevron-back" size={22} color="#0F172A" />
         </TouchableOpacity>
-        <Text style={styles.title}>Pending Deletion</Text>
-        <View style={{ width: 24 }} />
+        <Text style={styles.title}>Pending Review</Text>
+        <View style={{ width: 44 }} />
       </View>
 
+      {/* ── Stat pills ── */}
+      {pendingDeletion.length > 0 && (
+        <View style={styles.statRow}>
+          <View style={[styles.statPill, { backgroundColor: '#F87171' }]}>
+            <Text style={styles.statPillText}>{pendingDeletion.length} Items</Text>
+          </View>
+          <View style={[styles.statPill, { backgroundColor: '#FDE047' }]}>
+            <Text style={styles.statPillText}>~{totalMB} MB Freed</Text>
+          </View>
+        </View>
+      )}
+
+      {/* ── Content ── */}
       {pendingDeletion.length === 0 ? (
-        <View style={styles.emptyState}>
-          <Ionicons name="layers-outline" size={64} color="#334155" />
-          <Text style={styles.emptyText}>Nothing queued for deletion.</Text>
+        <View style={styles.empty}>
+          <View style={styles.emptyIcon}>
+            <Ionicons name="layers-outline" size={40} color="#0F172A" />
+          </View>
+          <Text style={styles.emptyText}>Nothing here yet.</Text>
+          <Text style={styles.emptySubText}>Swipe left on images to add them here.</Text>
         </View>
       ) : (
-        <>
-          <FlatList
-            data={pendingDeletion}
-            numColumns={3}
-            keyExtractor={item => item.id}
-            renderItem={renderItem}
-            contentContainerStyle={styles.grid}
-          />
-          <View style={styles.footer}>
-            <TouchableOpacity 
-              style={[styles.deleteButton, isDeleting && { opacity: 0.7 }]} 
-              onPress={handleConfirmDeletion}
-              disabled={isDeleting}
-            >
-              {isDeleting ? (
-                <ActivityIndicator color="#fff" />
-              ) : (
-                <Text style={styles.deleteButtonText}>Delete {pendingDeletion.length} Items permanently</Text>
-              )}
-            </TouchableOpacity>
-          </View>
-        </>
+        <FlatList
+          data={pendingDeletion}
+          numColumns={3}
+          keyExtractor={item => item.id}
+          renderItem={renderItem}
+          contentContainerStyle={styles.grid}
+          showsVerticalScrollIndicator={false}
+        />
+      )}
+
+      {/* ── Delete button ── */}
+      {pendingDeletion.length > 0 && (
+        <View style={[styles.footer, { paddingBottom: Math.max(insets.bottom + 12, 28) }]}>
+          <TouchableOpacity
+            style={[styles.deleteBtn, isDeleting && { opacity: 0.7 }]}
+            onPress={handleDelete}
+            disabled={isDeleting}
+            activeOpacity={0.85}
+          >
+            {isDeleting ? (
+              <ActivityIndicator color="#0F172A" />
+            ) : (
+              <Text style={styles.deleteBtnText}>DELETE PERMANENTLY</Text>
+            )}
+          </TouchableOpacity>
+        </View>
       )}
     </View>
   );
 }
 
+const ITEM_SIZE = (StyleSheet.hairlineWidth, (() => {
+  const { width } = require('react-native').Dimensions.get('window');
+  return (width - 48) / 3;   // 3 cols, 16px gutter each side + between
+})());
+
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#0f172a',
-  },
+  container: { flex: 1, backgroundColor: '#4ADE80' },
+
+  /* Header */
   header: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 20,
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: '#1e293b',
+    paddingHorizontal: 18,
+    paddingTop: 10,
+    paddingBottom: 10,
   },
-  backButton: {
-    padding: 8,
-  },
-  title: {
-    fontSize: 20,
-    fontWeight: 'bold',
-    color: '#ef4444',
-  },
-  emptyState: {
-    flex: 1,
+  backBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 3,
+    borderColor: '#0F172A',
     justifyContent: 'center',
     alignItems: 'center',
+    boxShadow: '3px 3px 0px 0px #0F172A',
   },
-  emptyText: {
-    color: '#94a3b8',
-    marginTop: 16,
-    fontSize: 16,
-  },
-  grid: {
-    padding: 2,
-  },
-  gridItem: {
-    flex: 1/3,
-    aspectRatio: 1,
-    padding: 2,
-    position: 'relative',
-  },
-  thumbnail: {
-    width: '100%',
-    height: '100%',
-    borderRadius: 8,
-  },
-  restoreButton: {
-    position: 'absolute',
-    bottom: 8,
-    right: 8,
-    backgroundColor: 'rgba(0,0,0,0.6)',
-    borderRadius: 16,
-    width: 32,
-    height: 32,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  footer: {
-    padding: 20,
-    paddingBottom: 40,
-    backgroundColor: '#1e293b',
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-  },
-  deleteButton: {
-    backgroundColor: '#ef4444',
-    paddingVertical: 16,
+  title: { fontSize: 22, fontWeight: '900', color: '#0F172A' },
+
+  /* Stat pills */
+  statRow: { flexDirection: 'row', gap: 8, paddingHorizontal: 18, paddingBottom: 12 },
+  statPill: {
     borderRadius: 99,
+    borderWidth: 2,
+    borderColor: '#0F172A',
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+    boxShadow: '2px 2px 0px 0px #0F172A',
+  },
+  statPillText: { fontSize: 13, fontWeight: '800', color: '#0F172A' },
+
+  /* Grid */
+  grid: { paddingHorizontal: 16, paddingBottom: 16, gap: 8 },
+  gridItem: {
+    width: ITEM_SIZE,
+    height: ITEM_SIZE,
+    borderRadius: 12,
+    borderWidth: 3,
+    borderColor: '#0F172A',
+    overflow: 'hidden',
+    backgroundColor: '#E2E8F0',
+    margin: 4,
+    position: 'relative',
+    boxShadow: '3px 3px 0px 0px #0F172A',
+  },
+  videoIndicator: {
+    position: 'absolute',
+    top: 5,
+    left: 5,
+    width: 18,
+    height: 18,
+    borderRadius: 99,
+    backgroundColor: '#A78BFA',
+    borderWidth: 2,
+    borderColor: '#0F172A',
+    justifyContent: 'center',
     alignItems: 'center',
   },
-  deleteButtonText: {
-    color: '#fff',
-    fontSize: 18,
-    fontWeight: 'bold',
+  restoreBtn: {
+    position: 'absolute',
+    bottom: 5,
+    right: 5,
+    width: 26,
+    height: 26,
+    borderRadius: 99,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 2,
+    borderColor: '#0F172A',
+    justifyContent: 'center',
+    alignItems: 'center',
   },
+
+  /* Empty */
+  empty: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24 },
+  emptyIcon: {
+    width: 80,
+    height: 80,
+    borderRadius: 99,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 3,
+    borderColor: '#0F172A',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 16,
+    boxShadow: '4px 4px 0px 0px #0F172A',
+  },
+  emptyText: { fontSize: 20, fontWeight: '900', color: '#0F172A' },
+  emptySubText: { fontSize: 14, fontWeight: '600', color: '#065F46', marginTop: 6, textAlign: 'center' },
+
+  /* Footer */
+  footer: {
+    paddingHorizontal: 18,
+    paddingTop: 16,
+    borderTopWidth: 3,
+    borderTopColor: '#0F172A',
+    backgroundColor: '#4ADE80',
+  },
+  deleteBtn: {
+    flexDirection: 'row',
+    backgroundColor: '#F87171',
+    borderRadius: 99,
+    borderWidth: 4,
+    borderColor: '#0F172A',
+    paddingVertical: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+    boxShadow: '6px 6px 0px 0px #0F172A',
+  },
+  deleteBtnText: { fontSize: 20, fontWeight: '800', color: '#0F172A', letterSpacing: 1 },
 });

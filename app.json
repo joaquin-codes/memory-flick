@@ -16,6 +16,7 @@
       "supportsTablet": true
     },
     "android": {
+      "package": "com.joaquin.memoryflick",
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
@@ -27,7 +28,20 @@
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
-      "expo-video"
-    ]
+      "expo-video",
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow Memory Flick to access your photos to organize them.",
+          "savePhotosPermission": "Allow Memory Flick to save photos.",
+          "isAccessMediaLocationEnabled": true
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "d7765f8f-4dcc-4e12-942b-275274a525ad"
+      }
+    }
   }
 }
