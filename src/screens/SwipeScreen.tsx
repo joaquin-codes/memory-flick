@@ -23,7 +23,11 @@ type Props = NativeStackScreenProps<RootStackParamList, 'Swipe'>;
 /* ── Video sub-component ── */
 const VideoCard = ({ uri }: { uri: string }) => {
   const player = useVideoPlayer(uri, p => { p.loop = true; p.play(); });
-  return <VideoView player={player} style={StyleSheet.absoluteFill} contentFit="cover" />;
+  return (
+    <View style={StyleSheet.absoluteFill} pointerEvents="none">
+      <VideoView player={player} style={StyleSheet.absoluteFill} contentFit="cover" nativeControls={false} />
+    </View>
+  );
 };
 
 export default function SwipeScreen({ route, navigation }: Props) {
@@ -56,7 +60,16 @@ export default function SwipeScreen({ route, navigation }: Props) {
     if (filter === 'images') list = list.filter(a => a.mediaType === MediaLibrary.MediaType.photo);
     else if (filter === 'videos') list = list.filter(a => a.mediaType === MediaLibrary.MediaType.video);
     if (hideReviewed) list = list.filter(a => !hiddenIdsRef.current.has(a.id));
-    if (sortBySize) list = [...list].sort((a, b) => (b.width * b.height) - (a.width * a.height));
+    if (sortBySize) {
+      const getEstSize = (a: MediaLibrary.Asset) => {
+        const base = (a.width || 0) * (a.height || 0);
+        if (a.mediaType === MediaLibrary.MediaType.video) {
+          return base * Math.max(1, a.duration || 1) * 30; // Video weight factor
+        }
+        return base;
+      };
+      list = [...list].sort((a, b) => getEstSize(b) - getEstSize(a));
+    }
 
     setAssets(list);
     if (

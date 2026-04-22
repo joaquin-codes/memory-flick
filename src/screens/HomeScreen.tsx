@@ -83,6 +83,15 @@ export default function HomeScreen({ navigation }: Props) {
     const videoCount = filteredAssets.filter(a => a.mediaType === MediaLibrary.MediaType.video).length;
     const badgeColor = BADGE_COLORS[index % BADGE_COLORS.length];
 
+    const totalAssets = group.assets.length;
+    let reviewedCount = 0;
+    group.assets.forEach(a => {
+      if (keptItems[a.id] || pendingDeletion.some(p => p.id === a.id)) {
+        reviewedCount++;
+      }
+    });
+    const progressPct = totalAssets > 0 ? (reviewedCount / totalAssets) * 100 : 0;
+
     return (
       <TouchableOpacity
         style={styles.card}
@@ -104,10 +113,15 @@ export default function HomeScreen({ navigation }: Props) {
           {videoCount > 0 && (
             <Text style={styles.cardSub}>{videoCount} video{videoCount !== 1 ? 's' : ''}</Text>
           )}
+          
+          {/* Small Month Progress Bar */}
+          <View style={styles.monthProgressTrack}>
+            <View style={[styles.monthProgressFill, { width: `${progressPct}%` }]} />
+          </View>
         </View>
       </TouchableOpacity>
     );
-  }, [filter, navigation]);
+  }, [filter, navigation, keptItems, pendingDeletion]);
 
   /* ── Loading ── */
   if (loading && allAssets.length === 0) {
@@ -344,6 +358,20 @@ const styles = StyleSheet.create({
   cardInfo: { padding: 10 },
   cardTitle: { fontSize: 15, fontWeight: '900', color: '#0F172A' },
   cardSub: { fontSize: 12, fontWeight: '600', color: '#475569', marginTop: 3 },
+  monthProgressTrack: {
+    height: 8,
+    backgroundColor: '#F1F5F9',
+    borderRadius: 99,
+    borderWidth: 1.5,
+    borderColor: '#0F172A',
+    overflow: 'hidden',
+    marginTop: 8,
+  },
+  monthProgressFill: {
+    height: '100%',
+    backgroundColor: '#4ADE80',
+    borderRadius: 99,
+  },
 
   /* Misc */
   loadingText: { marginTop: 16, color: '#0F172A', fontSize: 15, fontWeight: '700' },
