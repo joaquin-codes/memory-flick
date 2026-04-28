@@ -11,6 +11,7 @@ import * as MediaLibrary from 'expo-media-library';
 
 import { RootStackParamList } from '../navigation/types';
 import { useMediaStore } from '../store/useMediaStore';
+import { estimateAssetBytes, formatBytes } from '../utils/mediaLibrary';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Trash'>;
 
@@ -21,17 +22,12 @@ export default function TrashScreen({ navigation }: Props) {
 
   const estimateBytes = (assets: any[]): number => {
     let total = 0;
-    for (const a of assets) {
-      if (a.mediaType === 'video') {
-        total += a.duration > 0 ? a.duration * 2 * 1024 * 1024 : 15 * 1024 * 1024;
-      } else {
-        total += a.width && a.height ? (a.width * a.height) / 3 : 3 * 1024 * 1024;
-      }
-    }
+    for (const a of assets) total += estimateAssetBytes(a);
     return total;
   };
 
-  const totalMB = (estimateBytes(pendingDeletion) / (1024 * 1024)).toFixed(1);
+  const totalBytes = estimateBytes(pendingDeletion);
+  const totalLabel = formatBytes(totalBytes);
 
   const handleDelete = async () => {
     if (!pendingDeletion.length) return;
@@ -52,7 +48,7 @@ export default function TrashScreen({ navigation }: Props) {
               if (ok) {
                 confirmDeletion(ids);
                 incrementSpaceSaved(bytes);
-                Alert.alert('Done!', `Freed up ~${(bytes / (1024 * 1024)).toFixed(1)} MB.`);
+                Alert.alert('Done!', `Freed up ~${formatBytes(bytes)}.`);
                 navigation.goBack();
               }
             } catch (e) {
@@ -69,7 +65,13 @@ export default function TrashScreen({ navigation }: Props) {
 
   const renderItem = ({ item }: { item: any }) => (
     <View style={styles.gridItem}>
-      <Image source={item.uri} style={StyleSheet.absoluteFill} contentFit="cover" />
+      <Image
+        source={item.uri}
+        style={StyleSheet.absoluteFill}
+        contentFit="cover"
+        cachePolicy="memory-disk"
+        recyclingKey={item.id}
+      />
       {item.mediaType === 'video' && (
         <View style={styles.videoIndicator}>
           <Ionicons name="play" size={10} color="#0F172A" />
@@ -100,7 +102,7 @@ export default function TrashScreen({ navigation }: Props) {
             <Text style={styles.statPillText}>{pendingDeletion.length} Items</Text>
           </View>
           <View style={[styles.statPill, { backgroundColor: '#FDE047' }]}>
-            <Text style={styles.statPillText}>~{totalMB} MB Freed</Text>
+            <Text style={styles.statPillText}>~{totalLabel} Freed</Text>
           </View>
         </View>
       )}
@@ -122,6 +124,10 @@ export default function TrashScreen({ navigation }: Props) {
           renderItem={renderItem}
           contentContainerStyle={styles.grid}
           showsVerticalScrollIndicator={false}
+          initialNumToRender={9}
+          maxToRenderPerBatch={9}
+          windowSize={5}
+          removeClippedSubviews
         />
       )}
 

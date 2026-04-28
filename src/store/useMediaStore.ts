@@ -22,21 +22,28 @@ interface MediaState {
   pendingDeletion: PendingAsset[];
   totalSpaceSavedBytes: number;
   lastAction: ActionHistory | null;
-  
-  // Ephemeral State
+
+  // Persisted asset index — kept so we don't show the full-screen loader
+  // on every cold start. Library deltas can be reconciled in the
+  // background after the UI is interactive.
   allAssets: MediaLibrary.Asset[];
+
+  // Ephemeral
   isFetchingMedia: boolean;
   mediaFetchProgress: { loaded: number; total: number };
-  
+  hasHydrated: boolean;
+
   // Actions
   setAllAssets: (assets: MediaLibrary.Asset[]) => void;
   setFetchingMedia: (isFetching: boolean) => void;
   setMediaFetchProgress: (loaded: number, total: number) => void;
+  setHasHydrated: (v: boolean) => void;
   keepItem: (asset: PendingAsset) => void;
   markForDeletion: (asset: PendingAsset) => void;
   undoLastAction: () => void;
   confirmDeletion: (deletedIds: string[]) => void;
   incrementSpaceSaved: (bytes: number) => void;
+  unswipeItem: (id: string) => void; // remove any reviewed status from a specific item
   restoreItem: (id: string) => void; // move from pending
   clearProgress: () => void; // debug
 }
@@ -51,10 +58,12 @@ export const useMediaStore = create<MediaState>()(
       allAssets: [],
       isFetchingMedia: false,
       mediaFetchProgress: { loaded: 0, total: 0 },
+      hasHydrated: false,
 
       setAllAssets: (assets) => set({ allAssets: assets }),
       setFetchingMedia: (isFetching) => set({ isFetchingMedia: isFetching }),
       setMediaFetchProgress: (loaded, total) => set({ mediaFetchProgress: { loaded, total } }),
+      setHasHydrated: (v) => set({ hasHydrated: v }),
 
       keepItem: (asset) => set((state) => ({
         keptItems: { ...state.keptItems, [asset.id]: true },
@@ -110,9 +119,19 @@ export const useMediaStore = create<MediaState>()(
         totalSpaceSavedBytes: state.totalSpaceSavedBytes + bytes
       })),
 
+      unswipeItem: (id) => set((state) => {
+        const newKept = { ...state.keptItems };
+        delete newKept[id];
+        const newLastAction = state.lastAction?.asset.id === id ? null : state.lastAction;
+        return {
+          keptItems: newKept,
+          pendingDeletion: state.pendingDeletion.filter(a => a.id !== id),
+          lastAction: newLastAction,
+        };
+      }),
+
       restoreItem: (id) => set((state) => ({
         pendingDeletion: state.pendingDeletion.filter(a => a.id !== id),
-        // optionally log lastAction here as null or handle undo
       })),
 
       clearProgress: () => set({
@@ -130,7 +149,23 @@ export const useMediaStore = create<MediaState>()(
         pendingDeletion: state.pendingDeletion,
         totalSpaceSavedBytes: state.totalSpaceSavedBytes,
         lastAction: state.lastAction,
+        // Persist the asset index so the second-launch experience is
+        // instant: the grid renders from disk while we silently
+        // reconcile any library changes in the background.
+        allAssets: state.allAssets,
       }),
+      onRehydrateStorage: () => () => {
+        // Use setState directly so this always fires — even if the
+        // rehydrated state object is undefined (storage read error).
+        useMediaStore.setState({ hasHydrated: true });
+      },
+      version: 2,
+      // If we ever change the asset shape, drop the cached list rather
+      // than crashing on stale entries.
+      migrate: (persisted: any, fromVersion) => {
+        if (fromVersion < 2 && persisted) persisted.allAssets = [];
+        return persisted;
+      },
     }
   )
 );

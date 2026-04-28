@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, Animated,
-  PanResponder, Dimensions, ActivityIndicator, FlatList, Modal, Pressable,
+  PanResponder, Dimensions, FlatList, Modal, Pressable,
 } from 'react-native';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { Ionicons } from '@expo/vector-icons';
@@ -10,7 +10,7 @@ import { Image } from 'expo-image';
 import { useVideoPlayer, VideoView } from 'expo-video';
 
 import { RootStackParamList } from '../navigation/types';
-import { groupAssetsByMonth } from '../utils/mediaLibrary';
+import { estimateAssetBytes, formatBytes } from '../utils/mediaLibrary';
 import { useMediaStore, PendingAsset } from '../store/useMediaStore';
 import * as MediaLibrary from 'expo-media-library';
 
@@ -20,58 +20,64 @@ const CARD_W = SCREEN_WIDTH - 48;   // 24 margin each side
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Swipe'>;
 
-/* ── Video sub-component ── */
-const VideoCard = ({ uri }: { uri: string }) => {
-  const player = useVideoPlayer(uri, p => { p.loop = true; p.play(); });
-  return (
-    <View style={StyleSheet.absoluteFill} pointerEvents="none">
-      <VideoView player={player} style={StyleSheet.absoluteFill} contentFit="cover" nativeControls={false} />
-    </View>
-  );
-};
-
 export default function SwipeScreen({ route, navigation }: Props) {
   const { monthKey, filter } = route.params;
   const insets = useSafeAreaInsets();
 
-  const [assets, setAssets] = useState<MediaLibrary.Asset[]>([]);
-  const [loading, setLoading] = useState(true);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [sortBySize, setSortBySize] = useState(true);
   const [hideReviewed, setHideReviewed] = useState(false);
   const [sortDropdown, setSortDropdown] = useState(false);
+  const [filterDropdown, setFilterDropdown] = useState(false);
 
   const flatListRef = useRef<FlatList>(null);
   const prevFilter = useRef(filter);
   const prevSort = useRef(sortBySize);
   const prevHide = useRef(hideReviewed);
-  const hiddenIdsRef = useRef<Set<string>>(new Set());
+  // Captured set of items considered "reviewed" at the moment Hide-Reviewed
+  // was switched on. We deliberately keep this snapshot stable so newly
+  // reviewed items in the current session aren't yanked out from under
+  // the user mid-swipe (which would visibly skip cards).
+  const hiddenSnapshotRef = useRef<Set<string> | null>(null);
 
   const {
     keptItems, pendingDeletion, keepItem,
-    markForDeletion, undoLastAction, allAssets, lastAction,
+    markForDeletion, unswipeItem, allAssets,
   } = useMediaStore();
 
-  /* ── derive asset list ── */
-  useEffect(() => {
-    const groups = groupAssetsByMonth(allAssets);
-    let list = groups.find(g => g.key === monthKey)?.assets || [];
+  // Build the list directly via filter (no full month-grouping) and use a
+  // proper byte-estimate for sort. Memoised so renders during a swipe
+  // don't re-sort the whole month.
+  const assets = useMemo<MediaLibrary.Asset[]>(() => {
+    let list = allAssets.filter(a => {
+      const d = new Date(a.creationTime);
+      const key = `${d.getFullYear()}-${(d.getMonth() + 1).toString().padStart(2, '0')}`;
+      return key === monthKey;
+    });
 
     if (filter === 'images') list = list.filter(a => a.mediaType === MediaLibrary.MediaType.photo);
     else if (filter === 'videos') list = list.filter(a => a.mediaType === MediaLibrary.MediaType.video);
-    if (hideReviewed) list = list.filter(a => !hiddenIdsRef.current.has(a.id));
-    if (sortBySize) {
-      const getEstSize = (a: MediaLibrary.Asset) => {
-        const base = (a.width || 0) * (a.height || 0);
-        if (a.mediaType === MediaLibrary.MediaType.video) {
-          return base * Math.max(1, a.duration || 1) * 30; // Video weight factor
-        }
-        return base;
-      };
-      list = [...list].sort((a, b) => getEstSize(b) - getEstSize(a));
+
+    if (hideReviewed && hiddenSnapshotRef.current) {
+      const hidden = hiddenSnapshotRef.current;
+      list = list.filter(a => !hidden.has(a.id));
     }
 
-    setAssets(list);
+    if (sortBySize) {
+      list = [...list].sort((a, b) => estimateAssetBytes(b) - estimateAssetBytes(a));
+    }
+    return list;
+  }, [allAssets, monthKey, filter, sortBySize, hideReviewed]);
+
+  // O(1) lookups for kept/pending — used by carousel + card overlays.
+  const pendingIds = useMemo(() => {
+    const s = new Set<string>();
+    for (const p of pendingDeletion) s.add(p.id);
+    return s;
+  }, [pendingDeletion]);
+
+  // Reset cursor when filter/sort/hide actually changes.
+  useEffect(() => {
     if (
       prevFilter.current !== filter ||
       prevSort.current !== sortBySize ||
@@ -82,8 +88,7 @@ export default function SwipeScreen({ route, navigation }: Props) {
       prevSort.current = sortBySize;
       prevHide.current = hideReviewed;
     }
-    setLoading(false);
-  }, [allAssets, monthKey, filter, sortBySize, hideReviewed]);
+  }, [filter, sortBySize, hideReviewed]);
 
   /* ── auto-scroll carousel ── */
   useEffect(() => {
@@ -100,25 +105,29 @@ export default function SwipeScreen({ route, navigation }: Props) {
   const assetsRef = useRef(assets);
   useEffect(() => { assetsRef.current = assets; }, [assets]);
 
-  /* ── auto-redirect when done ── */
+  /* ── auto-redirect when the user finishes the stack ──
+   * Only fires when the user actually walked the cards to the end
+   * (currentIndex > 0). The empty-state (e.g. all reviewed + Hide
+   * Reviewed on) is handled by an explicit UI below — never as a
+   * silent navigation away — and never as an infinite spinner. */
   useEffect(() => {
-    if (!loading && assets.length > 0 && currentIndex >= assets.length) {
+    if (currentIndex > 0 && assets.length > 0 && currentIndex >= assets.length) {
       if (pendingDeletion.length > 0) navigation.replace('Trash', { monthKey });
       else navigation.goBack();
     }
-  }, [loading, assets.length, currentIndex, pendingDeletion.length, navigation]);
+  }, [assets.length, currentIndex, pendingDeletion.length, navigation, monthKey]);
 
-  /* ── swipe animation ── */
+  /* ── swipe animation (transform-only -> native driver = 60fps) ── */
   const position = useRef(new Animated.ValueXY()).current;
 
   const forceSwipe = (direction: 'right' | 'left') => {
     const x = direction === 'right' ? SCREEN_WIDTH + 100 : -SCREEN_WIDTH - 100;
-    Animated.timing(position, { toValue: { x, y: 0 }, duration: 250, useNativeDriver: false })
+    Animated.timing(position, { toValue: { x, y: 0 }, duration: 220, useNativeDriver: true })
       .start(() => onSwipeComplete(direction));
   };
 
   const resetPosition = () => {
-    Animated.spring(position, { toValue: { x: 0, y: 0 }, friction: 5, useNativeDriver: false }).start();
+    Animated.spring(position, { toValue: { x: 0, y: 0 }, friction: 5, useNativeDriver: true }).start();
   };
 
   const onSwipeComplete = (direction: 'right' | 'left') => {
@@ -168,44 +177,100 @@ export default function SwipeScreen({ route, navigation }: Props) {
     );
   };
 
+  /* ── shared video player ──
+   * The previous implementation created a brand new ExoPlayer (Android)
+   * every time the active card became a video, which is what made
+   * "Videos take too long to load" — every swipe paid the decoder
+   * cold-start cost. We now keep one player alive for the screen and
+   * swap its source via `replaceAsync` when the current video changes.
+   * Photos pause the player; videos play it. */
+  const videoPlayer = useVideoPlayer(null as any, p => { p.loop = true; p.muted = false; });
+
+  const currentAsset: MediaLibrary.Asset | undefined = assets[currentIndex];
+  const currentIsVideo = currentAsset?.mediaType === MediaLibrary.MediaType.video;
+
+  useEffect(() => {
+    if (!videoPlayer) return;
+    if (currentIsVideo && currentAsset?.uri) {
+      // replaceAsync keeps the codec / surface warm between videos.
+      const p: any = videoPlayer;
+      try {
+        if (typeof p.replaceAsync === 'function') p.replaceAsync(currentAsset.uri);
+        else if (typeof p.replace === 'function') p.replace(currentAsset.uri);
+        videoPlayer.play();
+      } catch (e) {
+        console.warn('video player swap failed', e);
+      }
+    } else {
+      try { videoPlayer.pause(); } catch {}
+    }
+  }, [currentIsVideo, currentAsset?.uri, videoPlayer]);
+
   const renderMedia = (asset: MediaLibrary.Asset, active: boolean) => {
     if (asset.mediaType === MediaLibrary.MediaType.video) {
-      if (!active) return (
-        <View style={styles.videoPlaceholder}>
-          <Ionicons name="videocam-outline" size={56} color="#475569" />
-          <Text style={styles.videoPlaceholderText}>Video</Text>
+      if (!active) {
+        return (
+          <View style={styles.videoPlaceholder}>
+            <Ionicons name="videocam-outline" size={56} color="#475569" />
+            <Text style={styles.videoPlaceholderText}>Video</Text>
+          </View>
+        );
+      }
+      return (
+        <View style={StyleSheet.absoluteFill} pointerEvents="none">
+          <VideoView
+            player={videoPlayer}
+            style={StyleSheet.absoluteFill}
+            contentFit="cover"
+            nativeControls={false}
+          />
         </View>
       );
-      return <VideoCard uri={asset.uri} />;
     }
-    return <Image source={asset.uri} style={StyleSheet.absoluteFill} contentFit="cover" transition={200} />;
+    return (
+      <Image
+        source={asset.uri}
+        style={StyleSheet.absoluteFill}
+        contentFit="cover"
+        transition={150}
+        cachePolicy="memory-disk"
+        recyclingKey={asset.id}
+      />
+    );
   };
 
-  /* ── toggle hide reviewed ── */
-  const toggleHideReviewed = () => {
-    const next = !hideReviewed;
-    if (next) {
-      const s = new Set<string>();
-      Object.keys(keptItems).forEach(id => s.add(id));
-      pendingDeletion.forEach(p => s.add(p.id));
-      hiddenIdsRef.current = s;
-    } else {
-      hiddenIdsRef.current = new Set();
-    }
-    setHideReviewed(next);
+  /* ── toggle hide reviewed ──
+   * "Hide Liked" hides items the user kept (keptItems only).
+   * Disliked/pending-deletion items stay visible so the user can
+   * still see and reconsider trash picks. */
+  const enableHideReviewed = () => {
+    const s = new Set<string>(Object.keys(keptItems));
+    hiddenSnapshotRef.current = s;
+    setHideReviewed(true);
+    setFilterDropdown(false);
   };
 
+  const disableHideReviewed = () => {
+    hiddenSnapshotRef.current = null;
+    setHideReviewed(false);
+    setFilterDropdown(false);
+  };
+
+  /* ── un-swipe the currently shown card ──
+   * Removes its liked OR disliked status so it becomes "unreviewed"
+   * again. Works regardless of whether it was the most recent swipe. */
   const handleUndo = () => {
-    if (!lastAction) return;
-    undoLastAction();
-    if (currentIndex > 0) setCurrentIndex(p => p - 1);
+    const current = assets[currentIndex];
+    if (!current) return;
+    const isReviewed = !!keptItems[current.id] || pendingIds.has(current.id);
+    if (isReviewed) unswipeItem(current.id);
   };
 
   /* ── carousel item ── */
-  const renderCarouselItem = ({ item, index: i }: { item: MediaLibrary.Asset; index: number }) => {
+  const renderCarouselItem = useCallback(({ item, index: i }: { item: MediaLibrary.Asset; index: number }) => {
     const isCurrent = i === currentIndex;
     const isKept = !!keptItems[item.id];
-    const isTrashed = pendingDeletion.some(p => p.id === item.id);
+    const isTrashed = pendingIds.has(item.id);
     const isVideo = item.mediaType === MediaLibrary.MediaType.video;
 
     return (
@@ -214,9 +279,13 @@ export default function SwipeScreen({ route, navigation }: Props) {
         activeOpacity={0.8}
         style={[styles.carouselItem, isCurrent && styles.carouselItemActive, (isKept || isTrashed) && { opacity: 0.65 }]}
       >
-        <Image source={item.uri} style={StyleSheet.absoluteFill} contentFit="cover" />
-
-        {/* Status badge */}
+        <Image
+          source={item.uri}
+          style={StyleSheet.absoluteFill}
+          contentFit="cover"
+          cachePolicy="memory-disk"
+          recyclingKey={item.id}
+        />
         {isTrashed && (
           <View style={[styles.carouselBadge, { backgroundColor: '#F87171' }]}>
             <Ionicons name="trash-outline" size={9} color="#0F172A" />
@@ -234,24 +303,82 @@ export default function SwipeScreen({ route, navigation }: Props) {
         )}
       </TouchableOpacity>
     );
-  };
+  }, [currentIndex, keptItems, pendingIds]);
 
-  /* ── loading / empty ── */
-  if (loading || (assets.length === 0 && !loading)) {
+  /* ── "all done" detection ──
+   * Separate from the empty-state (which means zero assets in month).
+   * This fires when assets exist but every single one has been reviewed. */
+  const allDone = assets.length > 0 && assets.every(a => !!keptItems[a.id] || pendingIds.has(a.id));
+
+  /* ── empty / done state ──
+   * Three situations end up here:
+   *   A) hideReviewed=true and nothing left unreviewed
+   *   B) allDone: every card has been swiped (liked or trashed)
+   *   C) filter produces zero results for this month */
+  if (assets.length === 0 || allDone) {
+    const isDoneState = allDone;
+    const isHideReviewedEmpty = assets.length === 0 && hideReviewed;
     return (
-      <View style={[styles.container, { justifyContent: 'center', alignItems: 'center' }]}>
-        <ActivityIndicator size="large" color="#0F172A" />
+      <View style={[styles.container, { paddingTop: insets.top }]}>
+        <View style={styles.header}>
+          <TouchableOpacity style={styles.iconBtn} onPress={() => navigation.goBack()}>
+            <Ionicons name="chevron-back" size={22} color="#0F172A" />
+          </TouchableOpacity>
+          <Text style={styles.headerTitle} numberOfLines={1}>{monthKey}</Text>
+          <View style={styles.iconBtn} />
+        </View>
+        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 32 }}>
+          <Ionicons
+            name={isDoneState || isHideReviewedEmpty ? 'checkmark-done-circle-outline' : 'images-outline'}
+            size={72}
+            color="#0F172A"
+          />
+          <Text style={[styles.headerTitle, { marginTop: 16, textAlign: 'center' }]}>
+            {isDoneState || isHideReviewedEmpty ? 'All swiped!' : 'Nothing here'}
+          </Text>
+          <Text style={{ color: '#0F172A', fontWeight: '600', fontSize: 14, marginTop: 8, textAlign: 'center', lineHeight: 20 }}>
+            {isDoneState
+              ? "You've gone through every photo and video\nin this month. Nice work."
+              : isHideReviewedEmpty
+                ? "All liked items are hidden.\nSwitch to 'Show All' to see them."
+                : 'No media in this month matches the current filter.'}
+          </Text>
+          <View style={{ flexDirection: 'row', gap: 10, marginTop: 24, flexWrap: 'wrap', justifyContent: 'center' }}>
+            {/* Only offer "Show All" when hide-liked mode is responsible for the empty view */}
+            {(isHideReviewedEmpty || (isDoneState && hideReviewed)) && (
+              <TouchableOpacity
+                style={[styles.controlPill, styles.controlPillLight]}
+                onPress={disableHideReviewed}
+              >
+                <Ionicons name="eye-outline" size={13} color="#0F172A" />
+                <Text style={styles.controlPillTextDark}>Show All</Text>
+              </TouchableOpacity>
+            )}
+            {pendingDeletion.length > 0 && (
+              <TouchableOpacity
+                style={[styles.controlPill, { backgroundColor: '#F87171' }]}
+                onPress={() => navigation.replace('Trash', { monthKey })}
+              >
+                <Ionicons name="trash-outline" size={13} color="#0F172A" />
+                <Text style={styles.controlPillTextDark}>
+                  Review {pendingDeletion.length} to delete
+                </Text>
+              </TouchableOpacity>
+            )}
+            <TouchableOpacity
+              style={styles.controlPill}
+              onPress={() => navigation.goBack()}
+            >
+              <Text style={styles.controlPillText}>Back to months</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
       </View>
     );
   }
 
-  const currentAsset = assets[currentIndex];
   const fileSizeLabel = currentAsset
-    ? (() => {
-        const px = (currentAsset.width || 0) * (currentAsset.height || 0);
-        const mb = px / (3 * 1024 * 1024);
-        return mb > 0 ? `~${mb.toFixed(1)} MB` : null;
-      })()
+    ? `~${formatBytes(estimateAssetBytes(currentAsset))}`
     : null;
 
   return (
@@ -268,33 +395,38 @@ export default function SwipeScreen({ route, navigation }: Props) {
         <TouchableOpacity
           style={[styles.iconBtn, { backgroundColor: '#FDE047' }]}
           onPress={handleUndo}
-          disabled={!lastAction}
+          disabled={!currentAsset || (!keptItems[currentAsset.id] && !pendingIds.has(currentAsset.id))}
         >
-          <Ionicons name="arrow-undo" size={20} color="#0F172A" style={{ opacity: lastAction ? 1 : 0.3 }} />
+          <Ionicons
+            name="arrow-undo"
+            size={20}
+            color="#0F172A"
+            style={{ opacity: (currentAsset && (keptItems[currentAsset.id] || pendingIds.has(currentAsset.id))) ? 1 : 0.3 }}
+          />
         </TouchableOpacity>
       </View>
 
-      {/* ── CONTROL BAR (Sort + Filter) ── */}
+      {/* ── CONTROL BAR ── */}
       <View style={styles.controlBar}>
-        {/* Sort pill with dropdown */}
-        <TouchableOpacity style={styles.controlPill} onPress={() => setSortDropdown(v => !v)}>
+        {/* Sort dropdown pill */}
+        <TouchableOpacity style={styles.controlPill} onPress={() => { setSortDropdown(v => !v); setFilterDropdown(false); }}>
           <Ionicons name="funnel-outline" size={13} color="#FDE047" />
           <Text style={styles.controlPillText}>{sortBySize ? 'Biggest First' : 'By Date'}</Text>
           <Ionicons name="chevron-down" size={13} color="#FDE047" />
         </TouchableOpacity>
 
-        {/* Show/hide reviewed */}
+        {/* Filter dropdown pill */}
         <TouchableOpacity
           style={[styles.controlPill, styles.controlPillLight, hideReviewed && styles.controlPillLightActive]}
-          onPress={toggleHideReviewed}
+          onPress={() => { setFilterDropdown(v => !v); setSortDropdown(false); }}
         >
           <Ionicons name={hideReviewed ? 'eye-off-outline' : 'eye-outline'} size={13} color="#0F172A" />
-          <Text style={styles.controlPillTextDark}>{hideReviewed ? 'Hide Reviewed' : 'Show All'}</Text>
+          <Text style={styles.controlPillTextDark}>{hideReviewed ? 'Hide Liked' : 'Show All'}</Text>
           <Ionicons name="chevron-down" size={13} color="#0F172A" />
         </TouchableOpacity>
       </View>
 
-      {/* ── SORT DROPDOWN MODAL ── */}
+      {/* ── SORT DROPDOWN ── */}
       <Modal transparent visible={sortDropdown} onRequestClose={() => setSortDropdown(false)} animationType="fade">
         <Pressable style={styles.modalOverlay} onPress={() => setSortDropdown(false)}>
           <View style={styles.dropdown}>
@@ -314,29 +446,49 @@ export default function SwipeScreen({ route, navigation }: Props) {
         </Pressable>
       </Modal>
 
-      {/* ── CARD STACK ── */}
+      {/* ── FILTER DROPDOWN ── */}
+      <Modal transparent visible={filterDropdown} onRequestClose={() => setFilterDropdown(false)} animationType="fade">
+        <Pressable style={styles.modalOverlay} onPress={() => setFilterDropdown(false)}>
+          <View style={[styles.dropdown, { left: undefined, right: 18, alignSelf: undefined }]}>
+            <TouchableOpacity
+              style={[styles.dropdownItem, !hideReviewed && styles.dropdownItemActive]}
+              onPress={disableHideReviewed}
+            >
+              <Text style={[styles.dropdownText, !hideReviewed && styles.dropdownTextActive]}>Show All</Text>
+              {!hideReviewed && <Ionicons name="checkmark" size={16} color="#0F172A" />}
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.dropdownItem, hideReviewed && styles.dropdownItemActive]}
+              onPress={enableHideReviewed}
+            >
+              <Text style={[styles.dropdownText, hideReviewed && styles.dropdownTextActive]}>Hide Liked</Text>
+              {hideReviewed && <Ionicons name="checkmark" size={16} color="#0F172A" />}
+            </TouchableOpacity>
+          </View>
+        </Pressable>
+      </Modal>
+
+      {/* ── CARD STACK ──
+       * Only ever render 2 cards, never iterate the full month list. The
+       * "behind" card sits below the active one (rendered first so the
+       * active one paints on top — no .reverse() needed). */}
       <View style={styles.cardContainer}>
-        {assets.map((asset, index) => {
-          if (index < currentIndex || index > currentIndex + 1) return null;
-          if (index === currentIndex) {
-            return (
-              <Animated.View key={asset.id} style={[styles.card, getCardStyle()]} {...panResponder.panHandlers}>
-                {renderMedia(asset, true)}
-                {renderStickers()}
-                {fileSizeLabel && (
-                  <View style={styles.sizeChip}>
-                    <Text style={styles.sizeChipText}>{fileSizeLabel}</Text>
-                  </View>
-                )}
-              </Animated.View>
-            );
-          }
-          return (
-            <Animated.View key={asset.id} style={[styles.card, styles.cardBehind]}>
-              {renderMedia(asset, false)}
-            </Animated.View>
-          );
-        }).reverse()}
+        {assets[currentIndex + 1] && (
+          <Animated.View key={assets[currentIndex + 1].id} style={[styles.card, styles.cardBehind]}>
+            {renderMedia(assets[currentIndex + 1], false)}
+          </Animated.View>
+        )}
+        {currentAsset && (
+          <Animated.View key={currentAsset.id} style={[styles.card, getCardStyle()]} {...panResponder.panHandlers}>
+            {renderMedia(currentAsset, true)}
+            {renderStickers()}
+            {fileSizeLabel && (
+              <View style={styles.sizeChip}>
+                <Text style={styles.sizeChipText}>{fileSizeLabel}</Text>
+              </View>
+            )}
+          </Animated.View>
+        )}
       </View>
 
       {/* ── UP NEXT label + CAROUSEL ── */}
@@ -355,6 +507,14 @@ export default function SwipeScreen({ route, navigation }: Props) {
             setTimeout(() => flatListRef.current?.scrollToIndex({ index: info.index, animated: true, viewPosition: 0.5 }), 500);
           }}
           renderItem={renderCarouselItem}
+          // Stable item width = thumbnail + margin. getItemLayout
+          // bypasses measurement and lets us scrollToIndex synchronously
+          // even when the target hasn't been mounted yet.
+          getItemLayout={(_, index) => ({ length: 68, offset: 68 * index, index })}
+          initialNumToRender={8}
+          maxToRenderPerBatch={6}
+          windowSize={5}
+          removeClippedSubviews
         />
       </View>
 
