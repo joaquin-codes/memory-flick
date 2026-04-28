@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useMemo, useCallback } from 'react';
+import React, { useEffect, useState, useMemo, useCallback, useRef } from 'react';
 import {
   View, Text, StyleSheet, FlatList, TouchableOpacity,
   ActivityIndicator, Dimensions,
@@ -32,13 +32,59 @@ export default function HomeScreen({ navigation }: Props) {
   const {
     keptItems, pendingDeletion, totalSpaceSavedBytes,
     allAssets, isFetchingMedia, mediaFetchProgress,
-    setAllAssets, setFetchingMedia, setMediaFetchProgress
+    setAllAssets, setFetchingMedia, setMediaFetchProgress,
+    hasHydrated,
   } = useMediaStore();
 
   const mediaGroups = useMemo(() => groupAssetsByMonth(allAssets), [allAssets]);
 
-  const loadMedia = async () => {
-    if (allAssets.length > 0 && !isFetchingMedia) {
+  // Reviewed = kept ∪ pending. Build once per change, look up O(1).
+  const reviewedIds = useMemo(() => {
+    const s = new Set<string>(Object.keys(keptItems));
+    for (const p of pendingDeletion) s.add(p.id);
+    return s;
+  }, [keptItems, pendingDeletion]);
+
+  // Per-group counts/thumbnails by filter; computed once per
+  // (mediaGroups, filter, reviewedIds) instead of on every card render.
+  const groupStats = useMemo(() => {
+    const map: Record<string, {
+      filteredCount: number;
+      videoCount: number;
+      reviewedCount: number;
+      thumbUri: string | null;
+    }> = {};
+    for (const g of mediaGroups) {
+      let filteredCount = 0;
+      let videoCount = 0;
+      let reviewedCount = 0;
+      let thumbUri: string | null = null;
+      for (const a of g.assets) {
+        const isVideo = a.mediaType === MediaLibrary.MediaType.video;
+        const matchesFilter =
+          filter === 'all' ||
+          (filter === 'images' && !isVideo) ||
+          (filter === 'videos' && isVideo);
+        if (!matchesFilter) continue;
+        filteredCount++;
+        if (isVideo) videoCount++;
+        if (reviewedIds.has(a.id)) reviewedCount++;
+        if (!thumbUri) thumbUri = a.uri;
+      }
+      map[g.key] = { filteredCount, videoCount, reviewedCount, thumbUri };
+    }
+    return map;
+  }, [mediaGroups, filter, reviewedIds]);
+
+  // Stable ref so loadMedia doesn't re-create every time allAssets changes
+  // (which would re-trigger the effect during every fetch batch).
+  const allAssetsCountRef = useRef(allAssets.length);
+  useEffect(() => { allAssetsCountRef.current = allAssets.length; }, [allAssets.length]);
+
+  const loadMedia = useCallback(async (force = false) => {
+    // If we already have a cached index, render immediately — this is what
+    // kills the "loading bar every time the app opens" behaviour.
+    if (!force && allAssetsCountRef.current > 0) {
       setLoading(false);
       setHasPermission(true);
       return;
@@ -48,15 +94,17 @@ export default function HomeScreen({ navigation }: Props) {
       setErrorMsg(null);
       const granted = await requestMediaPermissions();
       setHasPermission(granted);
-      if (granted) {
-        setLoading(false);
-        setFetchingMedia(true);
-        const assets = await fetchAllMedia((currentAssets, _hasNext, totalCount) => {
-          setAllAssets(currentAssets);
-          setMediaFetchProgress(currentAssets.length, totalCount);
-        });
-        setAllAssets(assets);
-      }
+      if (!granted) return;
+
+      // Drop the full-screen spinner the moment permission is granted.
+      // The in-page progress card communicates any ongoing background fetch.
+      setLoading(false);
+      setFetchingMedia(true);
+      const assets = await fetchAllMedia((currentAssets, _hasNext, totalCount) => {
+        setAllAssets(currentAssets);
+        setMediaFetchProgress(currentAssets.length, totalCount);
+      });
+      setAllAssets(assets);
     } catch (err: any) {
       console.warn(err);
       setErrorMsg(err.message || 'Failed to load media.');
@@ -64,9 +112,15 @@ export default function HomeScreen({ navigation }: Props) {
       setLoading(false);
       setFetchingMedia(false);
     }
-  };
+  }, [setAllAssets, setFetchingMedia, setMediaFetchProgress]); // stable — reads count via ref
 
-  useEffect(() => { loadMedia(); }, []);
+  // Wait for the persisted store to hydrate before kicking off any work.
+  // Once hasHydrated flips to true it never goes back, so this effect fires
+  // exactly once per screen mount after the AsyncStorage read completes.
+  useEffect(() => {
+    if (!hasHydrated) return;
+    loadMedia();
+  }, [hasHydrated, loadMedia]);
 
   const totalPending = pendingDeletion.length;
   const fetchPct = mediaFetchProgress.total > 0
@@ -74,23 +128,12 @@ export default function HomeScreen({ navigation }: Props) {
     : 0;
 
   const renderGroup = useCallback(({ item: group, index }: { item: MonthGroup; index: number }) => {
-    let filteredAssets = group.assets;
-    if (filter === 'images') filteredAssets = filteredAssets.filter(a => a.mediaType === MediaLibrary.MediaType.photo);
-    else if (filter === 'videos') filteredAssets = filteredAssets.filter(a => a.mediaType === MediaLibrary.MediaType.video);
-    if (filteredAssets.length === 0) return null;
+    const stats = groupStats[group.key];
+    if (!stats || stats.filteredCount === 0 || !stats.thumbUri) return null;
 
-    const firstAsset = filteredAssets[0];
-    const videoCount = filteredAssets.filter(a => a.mediaType === MediaLibrary.MediaType.video).length;
     const badgeColor = BADGE_COLORS[index % BADGE_COLORS.length];
-
     const totalAssets = group.assets.length;
-    let reviewedCount = 0;
-    group.assets.forEach(a => {
-      if (keptItems[a.id] || pendingDeletion.some(p => p.id === a.id)) {
-        reviewedCount++;
-      }
-    });
-    const progressPct = totalAssets > 0 ? (reviewedCount / totalAssets) * 100 : 0;
+    const progressPct = totalAssets > 0 ? (stats.reviewedCount / totalAssets) * 100 : 0;
 
     return (
       <TouchableOpacity
@@ -98,33 +141,38 @@ export default function HomeScreen({ navigation }: Props) {
         activeOpacity={0.85}
         onPress={() => navigation.navigate('Swipe', { monthKey: group.key, filter })}
       >
-        {/* Thumbnail */}
         <View style={styles.cardThumb}>
-          <Image source={firstAsset.uri} style={styles.cardThumbImage} contentFit="cover" />
-          {/* Count badge */}
+          <Image
+            source={stats.thumbUri}
+            style={styles.cardThumbImage}
+            contentFit="cover"
+            cachePolicy="memory-disk"
+            recyclingKey={stats.thumbUri}
+          />
           <View style={[styles.countBadge, { backgroundColor: badgeColor }]}>
-            <Text style={styles.countBadgeText}>{filteredAssets.length}</Text>
+            <Text style={styles.countBadgeText}>{stats.filteredCount}</Text>
           </View>
         </View>
 
-        {/* Info */}
         <View style={styles.cardInfo}>
           <Text style={styles.cardTitle} numberOfLines={1}>{group.title}</Text>
-          {videoCount > 0 && (
-            <Text style={styles.cardSub}>{videoCount} video{videoCount !== 1 ? 's' : ''}</Text>
+          {stats.videoCount > 0 && (
+            <Text style={styles.cardSub}>{stats.videoCount} video{stats.videoCount !== 1 ? 's' : ''}</Text>
           )}
-          
-          {/* Small Month Progress Bar */}
           <View style={styles.monthProgressTrack}>
             <View style={[styles.monthProgressFill, { width: `${progressPct}%` }]} />
           </View>
         </View>
       </TouchableOpacity>
     );
-  }, [filter, navigation, keptItems, pendingDeletion]);
+  }, [filter, navigation, groupStats]);
 
-  /* ── Loading ── */
-  if (loading && allAssets.length === 0) {
+  /* ── Loading ──
+   * Only show the full-screen splash on a first-time install (no
+   * cached index). On every subsequent open we render the grid
+   * immediately from the persisted index and let the in-page
+   * progress card communicate any background refresh. */
+  if ((loading || !hasHydrated) && allAssets.length === 0) {
     return (
       <View style={[styles.container, styles.center]}>
         <ActivityIndicator size="large" color="#A78BFA" />
@@ -143,7 +191,7 @@ export default function HomeScreen({ navigation }: Props) {
             ? `Error: ${errorMsg}\n\nNote: Expo Go limits Media Library access. You may need a Development Build.`
             : 'We need permission to access your media.'}
         </Text>
-        <TouchableOpacity style={styles.primaryButton} onPress={loadMedia}>
+        <TouchableOpacity style={styles.primaryButton} onPress={() => loadMedia(true)}>
           <Text style={styles.primaryButtonText}>Try Again</Text>
         </TouchableOpacity>
       </View>
@@ -215,6 +263,10 @@ export default function HomeScreen({ navigation }: Props) {
         columnWrapperStyle={styles.row}
         contentContainerStyle={styles.listContent}
         showsVerticalScrollIndicator={false}
+        initialNumToRender={6}
+        maxToRenderPerBatch={6}
+        windowSize={5}
+        removeClippedSubviews
       />
     </View>
   );
