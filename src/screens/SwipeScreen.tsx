@@ -305,82 +305,22 @@ export default function SwipeScreen({ route, navigation }: Props) {
     );
   }, [currentIndex, keptItems, pendingIds]);
 
-  /* ── "all done" detection ──
-   * Separate from the empty-state (which means zero assets in month).
-   * This fires when assets exist but every single one has been reviewed. */
+  // True when every asset in the filtered list has already been reviewed.
+  // Shown as a "done" screen rather than a blank swipe stack.
   const allDone = assets.length > 0 && assets.every(a => !!keptItems[a.id] || pendingIds.has(a.id));
+  const showDoneScreen = assets.length === 0 || allDone;
 
-  /* ── empty / done state ──
-   * Three situations end up here:
-   *   A) hideReviewed=true and nothing left unreviewed
-   *   B) allDone: every card has been swiped (liked or trashed)
-   *   C) filter produces zero results for this month */
-  if (assets.length === 0 || allDone) {
-    const isDoneState = allDone;
-    const isHideReviewedEmpty = assets.length === 0 && hideReviewed;
-    return (
-      <View style={[styles.container, { paddingTop: insets.top }]}>
-        <View style={styles.header}>
-          <TouchableOpacity style={styles.iconBtn} onPress={() => navigation.goBack()}>
-            <Ionicons name="chevron-back" size={22} color="#0F172A" />
-          </TouchableOpacity>
-          <Text style={styles.headerTitle} numberOfLines={1}>{monthKey}</Text>
-          <View style={styles.iconBtn} />
-        </View>
-        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 32 }}>
-          <Ionicons
-            name={isDoneState || isHideReviewedEmpty ? 'checkmark-done-circle-outline' : 'images-outline'}
-            size={72}
-            color="#0F172A"
-          />
-          <Text style={[styles.headerTitle, { marginTop: 16, textAlign: 'center' }]}>
-            {isDoneState || isHideReviewedEmpty ? 'All swiped!' : 'Nothing here'}
-          </Text>
-          <Text style={{ color: '#0F172A', fontWeight: '600', fontSize: 14, marginTop: 8, textAlign: 'center', lineHeight: 20 }}>
-            {isDoneState
-              ? "You've gone through every photo and video\nin this month. Nice work."
-              : isHideReviewedEmpty
-                ? "All liked items are hidden.\nSwitch to 'Show All' to see them."
-                : 'No media in this month matches the current filter.'}
-          </Text>
-          <View style={{ flexDirection: 'row', gap: 10, marginTop: 24, flexWrap: 'wrap', justifyContent: 'center' }}>
-            {/* Only offer "Show All" when hide-liked mode is responsible for the empty view */}
-            {(isHideReviewedEmpty || (isDoneState && hideReviewed)) && (
-              <TouchableOpacity
-                style={[styles.controlPill, styles.controlPillLight]}
-                onPress={disableHideReviewed}
-              >
-                <Ionicons name="eye-outline" size={13} color="#0F172A" />
-                <Text style={styles.controlPillTextDark}>Show All</Text>
-              </TouchableOpacity>
-            )}
-            {pendingDeletion.length > 0 && (
-              <TouchableOpacity
-                style={[styles.controlPill, { backgroundColor: '#F87171' }]}
-                onPress={() => navigation.replace('Trash', { monthKey })}
-              >
-                <Ionicons name="trash-outline" size={13} color="#0F172A" />
-                <Text style={styles.controlPillTextDark}>
-                  Review {pendingDeletion.length} to delete
-                </Text>
-              </TouchableOpacity>
-            )}
-            <TouchableOpacity
-              style={styles.controlPill}
-              onPress={() => navigation.goBack()}
-            >
-              <Text style={styles.controlPillText}>Back to months</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </View>
-    );
-  }
+  const isDoneState = allDone;
+  const isHideReviewedEmpty = assets.length === 0 && hideReviewed;
 
-  const fileSizeLabel = currentAsset
+  const fileSizeLabel = !showDoneScreen && currentAsset
     ? `~${formatBytes(estimateAssetBytes(currentAsset))}`
     : null;
 
+  const currentCardReviewed = !!currentAsset && (!!keptItems[currentAsset.id] || pendingIds.has(currentAsset.id));
+
+  // Single unified return — the control bar and both dropdowns are always
+  // in the tree so the filter is accessible even from the done screen.
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
 
@@ -392,30 +332,36 @@ export default function SwipeScreen({ route, navigation }: Props) {
 
         <Text style={styles.headerTitle} numberOfLines={1}>{monthKey}</Text>
 
-        <TouchableOpacity
-          style={[styles.iconBtn, { backgroundColor: '#FDE047' }]}
-          onPress={handleUndo}
-          disabled={!currentAsset || (!keptItems[currentAsset.id] && !pendingIds.has(currentAsset.id))}
-        >
-          <Ionicons
-            name="arrow-undo"
-            size={20}
-            color="#0F172A"
-            style={{ opacity: (currentAsset && (keptItems[currentAsset.id] || pendingIds.has(currentAsset.id))) ? 1 : 0.3 }}
-          />
-        </TouchableOpacity>
+        {/* Undo button: only meaningful in swipe mode */}
+        {!showDoneScreen ? (
+          <TouchableOpacity
+            style={[styles.iconBtn, { backgroundColor: '#FDE047' }]}
+            onPress={handleUndo}
+            disabled={!currentCardReviewed}
+          >
+            <Ionicons
+              name="arrow-undo"
+              size={20}
+              color="#0F172A"
+              style={{ opacity: currentCardReviewed ? 1 : 0.3 }}
+            />
+          </TouchableOpacity>
+        ) : (
+          <View style={styles.iconBtn} />
+        )}
       </View>
 
-      {/* ── CONTROL BAR ── */}
+      {/* ── CONTROL BAR — always visible ── */}
       <View style={styles.controlBar}>
-        {/* Sort dropdown pill */}
-        <TouchableOpacity style={styles.controlPill} onPress={() => { setSortDropdown(v => !v); setFilterDropdown(false); }}>
+        <TouchableOpacity
+          style={styles.controlPill}
+          onPress={() => { setSortDropdown(v => !v); setFilterDropdown(false); }}
+        >
           <Ionicons name="funnel-outline" size={13} color="#FDE047" />
           <Text style={styles.controlPillText}>{sortBySize ? 'Biggest First' : 'By Date'}</Text>
           <Ionicons name="chevron-down" size={13} color="#FDE047" />
         </TouchableOpacity>
 
-        {/* Filter dropdown pill */}
         <TouchableOpacity
           style={[styles.controlPill, styles.controlPillLight, hideReviewed && styles.controlPillLightActive]}
           onPress={() => { setFilterDropdown(v => !v); setSortDropdown(false); }}
@@ -468,70 +414,107 @@ export default function SwipeScreen({ route, navigation }: Props) {
         </Pressable>
       </Modal>
 
-      {/* ── CARD STACK ──
-       * Only ever render 2 cards, never iterate the full month list. The
-       * "behind" card sits below the active one (rendered first so the
-       * active one paints on top — no .reverse() needed). */}
-      <View style={styles.cardContainer}>
-        {assets[currentIndex + 1] && (
-          <Animated.View key={assets[currentIndex + 1].id} style={[styles.card, styles.cardBehind]}>
-            {renderMedia(assets[currentIndex + 1], false)}
-          </Animated.View>
-        )}
-        {currentAsset && (
-          <Animated.View key={currentAsset.id} style={[styles.card, getCardStyle()]} {...panResponder.panHandlers}>
-            {renderMedia(currentAsset, true)}
-            {renderStickers()}
-            {fileSizeLabel && (
-              <View style={styles.sizeChip}>
-                <Text style={styles.sizeChipText}>{fileSizeLabel}</Text>
-              </View>
+      {/* ── DONE SCREEN (inline, not an early return) ── */}
+      {showDoneScreen && (
+        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 32 }}>
+          <Ionicons
+            name={isDoneState || isHideReviewedEmpty ? 'checkmark-done-circle-outline' : 'images-outline'}
+            size={72}
+            color="#0F172A"
+          />
+          <Text style={[styles.headerTitle, { marginTop: 16, textAlign: 'center' }]}>
+            {isDoneState || isHideReviewedEmpty ? 'All swiped!' : 'Nothing here'}
+          </Text>
+          <Text style={{ color: '#0F172A', fontWeight: '600', fontSize: 14, marginTop: 8, textAlign: 'center', lineHeight: 20 }}>
+            {isDoneState
+              ? "You've gone through every photo and video in this month."
+              : isHideReviewedEmpty
+                ? 'All liked photos are hidden — use the filter above to show them.'
+                : 'No media in this month matches the current filter.'}
+          </Text>
+          <View style={{ flexDirection: 'row', gap: 10, marginTop: 24, flexWrap: 'wrap', justifyContent: 'center' }}>
+            {pendingDeletion.length > 0 && (
+              <TouchableOpacity
+                style={[styles.controlPill, { backgroundColor: '#F87171' }]}
+                onPress={() => navigation.replace('Trash', { monthKey })}
+              >
+                <Ionicons name="trash-outline" size={13} color="#0F172A" />
+                <Text style={styles.controlPillTextDark}>
+                  Review {pendingDeletion.length} to delete
+                </Text>
+              </TouchableOpacity>
             )}
-          </Animated.View>
-        )}
-      </View>
+            <TouchableOpacity style={styles.controlPill} onPress={() => navigation.goBack()}>
+              <Text style={styles.controlPillText}>Back to months</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
 
-      {/* ── UP NEXT label + CAROUSEL ── */}
-      <View style={styles.carouselSection}>
-        <Text style={styles.carouselLabel}>
-          UP NEXT · {currentIndex + 1} / {assets.length}
-        </Text>
-        <FlatList
-          ref={flatListRef}
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          data={assets}
-          keyExtractor={item => item.id}
-          contentContainerStyle={{ paddingHorizontal: 16 }}
-          onScrollToIndexFailed={info => {
-            setTimeout(() => flatListRef.current?.scrollToIndex({ index: info.index, animated: true, viewPosition: 0.5 }), 500);
-          }}
-          renderItem={renderCarouselItem}
-          // Stable item width = thumbnail + margin. getItemLayout
-          // bypasses measurement and lets us scrollToIndex synchronously
-          // even when the target hasn't been mounted yet.
-          getItemLayout={(_, index) => ({ length: 68, offset: 68 * index, index })}
-          initialNumToRender={8}
-          maxToRenderPerBatch={6}
-          windowSize={5}
-          removeClippedSubviews
-        />
-      </View>
+      {/* ── SWIPE UI (card stack + carousel + buttons) ── */}
+      {!showDoneScreen && (
+        <>
+          {/* Card stack — only ever 2 cards in the tree */}
+          <View style={styles.cardContainer}>
+            {assets[currentIndex + 1] && (
+              <Animated.View key={assets[currentIndex + 1].id} style={[styles.card, styles.cardBehind]}>
+                {renderMedia(assets[currentIndex + 1], false)}
+              </Animated.View>
+            )}
+            {currentAsset && (
+              <Animated.View key={currentAsset.id} style={[styles.card, getCardStyle()]} {...panResponder.panHandlers}>
+                {renderMedia(currentAsset, true)}
+                {renderStickers()}
+                {fileSizeLabel && (
+                  <View style={styles.sizeChip}>
+                    <Text style={styles.sizeChipText}>{fileSizeLabel}</Text>
+                  </View>
+                )}
+              </Animated.View>
+            )}
+          </View>
 
-      {/* ── ACTION BUTTONS ── */}
-      <View style={[styles.actions, { paddingBottom: Math.max(insets.bottom + 8, 24) }]}>
-        <TouchableOpacity style={[styles.actionBtn, styles.actionTrash]} onPress={() => forceSwipe('left')}>
-          <Ionicons name="trash-outline" size={28} color="#0F172A" />
-        </TouchableOpacity>
+          {/* Up-next carousel */}
+          <View style={styles.carouselSection}>
+            <Text style={styles.carouselLabel}>
+              UP NEXT · {currentIndex + 1} / {assets.length}
+            </Text>
+            <FlatList
+              ref={flatListRef}
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              data={assets}
+              keyExtractor={item => item.id}
+              contentContainerStyle={{ paddingHorizontal: 16 }}
+              onScrollToIndexFailed={info => {
+                setTimeout(() => flatListRef.current?.scrollToIndex({ index: info.index, animated: true, viewPosition: 0.5 }), 500);
+              }}
+              renderItem={renderCarouselItem}
+              getItemLayout={(_, index) => ({ length: 68, offset: 68 * index, index })}
+              initialNumToRender={8}
+              maxToRenderPerBatch={6}
+              windowSize={5}
+              removeClippedSubviews
+            />
+          </View>
 
-        <TouchableOpacity style={[styles.actionBtn, styles.actionSkip]} onPress={() => setCurrentIndex(p => Math.min(p + 1, assets.length - 1))}>
-          <Ionicons name="play-forward" size={22} color="#0F172A" />
-        </TouchableOpacity>
-
-        <TouchableOpacity style={[styles.actionBtn, styles.actionKeep]} onPress={() => forceSwipe('right')}>
-          <Ionicons name="heart-outline" size={30} color="#0F172A" />
-        </TouchableOpacity>
-      </View>
+          {/* Action buttons */}
+          <View style={[styles.actions, { paddingBottom: Math.max(insets.bottom + 8, 24) }]}>
+            <TouchableOpacity style={[styles.actionBtn, styles.actionTrash]} onPress={() => forceSwipe('left')}>
+              <Ionicons name="trash-outline" size={28} color="#0F172A" />
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.actionBtn, styles.actionSkip]}
+              onPress={() => setCurrentIndex(p => Math.min(p + 1, assets.length - 1))}
+            >
+              <Ionicons name="play-forward" size={22} color="#0F172A" />
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.actionBtn, styles.actionKeep]} onPress={() => forceSwipe('right')}>
+              <Ionicons name="heart-outline" size={30} color="#0F172A" />
+            </TouchableOpacity>
+          </View>
+        </>
+      )}
     </View>
   );
 }
