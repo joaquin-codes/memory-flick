@@ -74,17 +74,15 @@ export default function SwipeScreen({ route, navigation }: Props) {
     }
 
     if (sortBySize) {
-      // Use the real cached size when we have one, else fall back to the
-      // dimension estimate. The list re-sorts as real sizes stream in,
-      // which is harmless because the swipe stack tracks by index+id.
-      list = [...list].sort((a, b) => {
-        const av = realSizes[a.id] ?? estimateAssetBytes(a);
-        const bv = realSizes[b.id] ?? estimateAssetBytes(b);
-        return bv - av;
-      });
+      // Sort by dimension-based estimate only — never by realSizes.
+      // Including realSizes in deps would re-sort the list every time a
+      // size loads asynchronously, which shifts indices and causes the
+      // "next card doesn't appear" bug. The size chip still shows the
+      // real value independently via realSizes[currentAsset.id].
+      list = [...list].sort((a, b) => estimateAssetBytes(b) - estimateAssetBytes(a));
     }
     return list;
-  }, [allAssets, monthKey, filter, sortBySize, hideReviewed, realSizes]);
+  }, [allAssets, monthKey, filter, sortBySize, hideReviewed]);
 
   const pendingIds = useMemo(() => {
     const s = new Set<string>();
@@ -850,8 +848,8 @@ const styles = StyleSheet.create({
     boxShadow: '5px 5px 0px 0px #0F172A',
   },
   actionBtnActive: {
-    borderWidth: 5,
-    boxShadow: '6px 6px 0px 0px #FDE047, 5px 5px 0px 0px #0F172A',
+    borderWidth: 6,
+    borderColor: '#FFFFFF',
   },
   actionTrash: { width: 68, height: 68, backgroundColor: '#F87171' },
   actionSkip: { width: 50, height: 50, backgroundColor: '#FFFFFF' },
