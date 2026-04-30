@@ -52,6 +52,11 @@ export default function SwipeScreen({ route, navigation }: Props) {
   // purpose.
   const hasSwipedRef = useRef(false);
 
+  // Lock that prevents starting a new swipe gesture or action-button tap
+  // while a swipe-off animation is already in flight. Without this, rapid
+  // taps corrupt the shared Animated position and leave the card stack blank.
+  const isAnimatingRef = useRef(false);
+
   const {
     keptItems, pendingDeletion, keepItem,
     markForDeletion, unswipeItem, allAssets,
@@ -151,9 +156,20 @@ export default function SwipeScreen({ route, navigation }: Props) {
   const position = useRef(new Animated.ValueXY()).current;
 
   const forceSwipe = (direction: 'right' | 'left') => {
+    // Ignore if a swipe animation is already running — prevents the user
+    // from double-tapping action buttons or swiping during fly-off.
+    if (isAnimatingRef.current) return;
+    isAnimatingRef.current = true;
     const x = direction === 'right' ? SCREEN_WIDTH + 100 : -SCREEN_WIDTH - 100;
     Animated.timing(position, { toValue: { x, y: 0 }, duration: 220, useNativeDriver: true })
-      .start(() => onSwipeComplete(direction));
+      .start(({ finished }) => {
+        if (finished) {
+          onSwipeComplete(direction);
+        } else {
+          // Animation was interrupted (e.g. component unmounted). Clear lock.
+          isAnimatingRef.current = false;
+        }
+      });
   };
 
   const resetPosition = () => {
@@ -163,21 +179,31 @@ export default function SwipeScreen({ route, navigation }: Props) {
   const onSwipeComplete = (direction: 'right' | 'left') => {
     const list = assetsRef.current;
     const idx = currentIndexRef.current;
-    if (!list.length || idx >= list.length) return;
     const item = list[idx];
-    if (!item) return;
-    const pa: PendingAsset = {
-      id: item.id, uri: item.uri, mediaType: item.mediaType,
-      width: item.width, height: item.height, duration: item.duration,
-    };
-    if (direction === 'right') keepItem(pa); else markForDeletion(pa);
-    hasSwipedRef.current = true;
+
+    if (item) {
+      const pa: PendingAsset = {
+        id: item.id, uri: item.uri, mediaType: item.mediaType,
+        width: item.width, height: item.height, duration: item.duration,
+      };
+      if (direction === 'right') keepItem(pa); else markForDeletion(pa);
+      hasSwipedRef.current = true;
+    }
+
+    // Reset the shared Animated position back to centre, then advance the
+    // index on the next animation frame. The one-frame delay lets the
+    // native driver process the reset before the new card mounts so that
+    // it doesn't briefly appear at the off-screen co-ordinate.
     position.setValue({ x: 0, y: 0 });
-    setCurrentIndex(p => p + 1);
+    requestAnimationFrame(() => {
+      if (item) setCurrentIndex(p => p + 1);
+      isAnimatingRef.current = false;
+    });
   };
 
   const panResponder = useRef(PanResponder.create({
-    onStartShouldSetPanResponder: () => true,
+    // Block new gestures while a swipe animation is in flight.
+    onStartShouldSetPanResponder: () => !isAnimatingRef.current,
     onPanResponderMove: (_, g) => { position.setValue({ x: g.dx, y: g.dy }); },
     onPanResponderRelease: (_, g) => {
       if (g.dx > SWIPE_THRESHOLD) forceSwipe('right');
@@ -214,8 +240,10 @@ export default function SwipeScreen({ route, navigation }: Props) {
   /* ── shared video player ──
    * One ExoPlayer for the whole screen — replace its source via
    * `replaceAsync` when the active video changes, instead of paying
-   * the codec cold-start cost on every swipe. */
-  const videoPlayer = useVideoPlayer(null as any, p => { p.loop = true; p.muted = false; });
+   * the codec cold-start cost on every swipe.
+   * Use an empty-string initial source instead of null to avoid native
+   * crashes when the player is initialised before any video is shown. */
+  const videoPlayer = useVideoPlayer('', p => { p.loop = true; p.muted = false; });
 
   const currentAsset: MediaLibrary.Asset | undefined = assets[currentIndex];
   const currentIsVideo = currentAsset?.mediaType === MediaLibrary.MediaType.video;
@@ -225,9 +253,21 @@ export default function SwipeScreen({ route, navigation }: Props) {
     if (currentIsVideo && currentAsset?.uri) {
       const p: any = videoPlayer;
       try {
-        if (typeof p.replaceAsync === 'function') p.replaceAsync(currentAsset.uri);
-        else if (typeof p.replace === 'function') p.replace(currentAsset.uri);
-        videoPlayer.play();
+        if (typeof p.replaceAsync === 'function') {
+          // Must await before calling play() — firing play() on a player
+          // that hasn't finished loading the new source causes an unhandled
+          // rejection that can crash the JS thread.
+          p.replaceAsync(currentAsset.uri)
+            .then(() => { try { videoPlayer.play(); } catch {} })
+            .catch((e: any) => {
+              console.warn('video replaceAsync failed', e);
+              // Attempt synchronous fallback so the card isn't permanently blank.
+              try { videoPlayer.play(); } catch {}
+            });
+        } else if (typeof p.replace === 'function') {
+          p.replace(currentAsset.uri);
+          videoPlayer.play();
+        }
       } catch (e) {
         console.warn('video player swap failed', e);
       }

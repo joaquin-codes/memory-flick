@@ -87,6 +87,21 @@ export default function HomeScreen({ navigation }: Props) {
     if (!force && allAssetsCountRef.current > 0) {
       setLoading(false);
       setHasPermission(true);
+      // Always kick off a silent background refresh so that:
+      //   • Photos taken since the last open are picked up
+      //   • A first-install where the user closed mid-fetch gets completed
+      // The in-page progress card communicates progress non-intrusively.
+      requestMediaPermissions().then(granted => {
+        if (!granted) return;
+        setFetchingMedia(true);
+        fetchAllMedia((currentAssets, _hasNext, totalCount) => {
+          setAllAssets(currentAssets);
+          setMediaFetchProgress(currentAssets.length, totalCount);
+        })
+          .then(assets => { setAllAssets(assets); })
+          .catch(err => console.warn('Background refresh failed', err))
+          .finally(() => setFetchingMedia(false));
+      });
       return;
     }
     try {

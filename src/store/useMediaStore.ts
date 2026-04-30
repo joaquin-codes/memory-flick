@@ -100,9 +100,9 @@ export const useMediaStore = create<MediaState>()(
 
       confirmDeletion: (deletedIds) => set((state) => {
         const deletedSet = new Set(deletedIds);
-        // Remove from pending 
+        // Remove from pending
         const remainingPending = state.pendingDeletion.filter(a => !deletedSet.has(a.id));
-        
+
         // Also remove from lastAction if it was the last action deleted
         let newLastAction = state.lastAction;
         if (state.lastAction && deletedSet.has(state.lastAction.asset.id)) {
@@ -111,7 +111,10 @@ export const useMediaStore = create<MediaState>()(
 
         return {
           pendingDeletion: remainingPending,
-          lastAction: newLastAction
+          lastAction: newLastAction,
+          // Purge from the persistent asset index so deleted files no longer
+          // appear in the Swipe carousel or Home grid after deletion.
+          allAssets: state.allAssets.filter(a => !deletedSet.has(a.id)),
         };
       }),
 
