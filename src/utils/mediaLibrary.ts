@@ -49,6 +49,28 @@ export const estimateAssetBytes = (asset: {
   return PHOTO_FALLBACK_BYTES;
 };
 
+/**
+ * Try to fetch the *real* on-disk size for an asset. Expo's MediaLibrary
+ * exposes a `fileSize` field through `getAssetInfoAsync` on iOS and on
+ * recent Android versions. Returns null when unavailable so callers can
+ * fall back to the dimension-based estimate.
+ *
+ * Skips mock assets (https URIs) and any id prefixed with `mock-` to
+ * avoid pointless native calls in the Expo Go demo path.
+ */
+export const fetchRealAssetSize = async (
+  asset: { id: string; uri: string }
+): Promise<number | null> => {
+  if (asset.id.startsWith('mock-') || asset.uri.startsWith('http')) return null;
+  try {
+    const info = await MediaLibrary.getAssetInfoAsync(asset.id);
+    const fileSize = (info as any)?.fileSize;
+    return typeof fileSize === 'number' && fileSize > 0 ? fileSize : null;
+  } catch {
+    return null;
+  }
+};
+
 export const formatBytes = (bytes: number): string => {
   if (!isFinite(bytes) || bytes <= 0) return '0 B';
   const KB = 1024, MB = KB * 1024, GB = MB * 1024;
@@ -117,43 +139,69 @@ export const fetchAllMedia = async (
   // If local fetching failed or returned 0 items due to Expo Go Sandbox, provide Mock Data for testing the UI
   if (allAssets.length === 0) {
     console.warn("Using mock data so you can test the UI!");
-    
-    // Create 12 photos
+
+    // Varied dimensions so each photo's estimated file size differs in
+    // the bottom-left chip — important for testing sort-by-size and the
+    // size label without needing real device media.
+    const MOCK_DIMS: Array<[number, number]> = [
+      [4032, 3024], // 12.2 MP iPhone landscape
+      [3024, 4032], // 12.2 MP iPhone portrait
+      [1080, 1920], // 2.1 MP screenshot
+      [800, 1200],  // 1.0 MP small portrait
+      [4000, 3000], // 12.0 MP DSLR
+      [1920, 1080], // 2.1 MP HD
+      [2560, 1920], // 4.9 MP
+      [3840, 2160], // 8.3 MP 4K
+      [1024, 768],  // 0.8 MP web
+      [2048, 1536], // 3.1 MP
+      [3000, 4000], // 12.0 MP portrait
+      [1600, 1200], // 1.9 MP
+    ];
+
     for (let i = 0; i < 12; i++) {
+      const [w, h] = MOCK_DIMS[i % MOCK_DIMS.length];
+      // Picsum serves whatever resolution we ask for; cap network bytes
+      // by requesting a thumbnail-sized version while keeping the asset's
+      // logical dimensions for size estimation.
+      const thumbW = Math.min(800, w);
+      const thumbH = Math.round(thumbW * h / w);
       allAssets.push({
         id: `mock-photo-${i}`,
         filename: `mock-photo-${i}.jpg`,
-        uri: `https://picsum.photos/seed/${i + 200}/400/600`, // Random internet photo
+        uri: `https://picsum.photos/seed/${i + 200}/${thumbW}/${thumbH}`,
         mediaType: MediaLibrary.MediaType.photo,
         mediaSubtypes: [],
-        width: 400,
-        height: 600,
-        creationTime: Date.now() - (i * 10000), // Same month, exactly sorted
+        width: w,
+        height: h,
+        creationTime: Date.now() - (i * 10000),
         modificationTime: Date.now(),
         duration: 0,
         albumId: 'mock-album'
       });
     }
 
-    // Create 3 videos
+    // Varied durations + resolutions = varied estimated bytes per video
     const videoUrls = [
       'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
       'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4',
       'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4'
     ];
+    const VIDEO_DIMS: Array<[number, number]> = [[1920, 1080], [1280, 720], [3840, 2160]];
+    const VIDEO_DURS = [15, 47, 120];
 
     for (let j = 0; j < 3; j++) {
+      const [w, h] = VIDEO_DIMS[j];
       allAssets.push({
         id: `mock-video-${j}`,
         filename: `mock-video-${j}.mp4`,
         uri: videoUrls[j],
         mediaType: MediaLibrary.MediaType.video,
         mediaSubtypes: [],
-        width: 1280,
-        height: 720,
-        creationTime: Date.now() - (150000) - (j * 10000), // Same month
+        width: w,
+        height: h,
+        creationTime: Date.now() - (150000) - (j * 10000),
         modificationTime: Date.now(),
-        duration: 15,
+        duration: VIDEO_DURS[j],
         albumId: 'mock-album'
       });
     }
