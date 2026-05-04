@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useMemo, useCallback, useRef } from 'react';
 import {
   View, Text, StyleSheet, FlatList, TouchableOpacity,
-  ActivityIndicator, Dimensions,
+  ActivityIndicator, Dimensions, Alert,
 } from 'react-native';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { Ionicons } from '@expo/vector-icons';
@@ -82,26 +82,14 @@ export default function HomeScreen({ navigation }: Props) {
   useEffect(() => { allAssetsCountRef.current = allAssets.length; }, [allAssets.length]);
 
   const loadMedia = useCallback(async (force = false) => {
-    // If we already have a cached index, render immediately — this is what
-    // kills the "loading bar every time the app opens" behaviour.
+    // If we already have a cached index, render immediately and DO NOT
+    // re-scan the library on every open. Re-scanning was causing the entire
+    // allAssets array to flicker (shrink → grow) while pages streamed in,
+    // which broke the SwipeScreen's `currentIndex` and made cards/carousel
+    // visibly desync. Use the explicit Refresh button (force=true) instead.
     if (!force && allAssetsCountRef.current > 0) {
       setLoading(false);
       setHasPermission(true);
-      // Always kick off a silent background refresh so that:
-      //   • Photos taken since the last open are picked up
-      //   • A first-install where the user closed mid-fetch gets completed
-      // The in-page progress card communicates progress non-intrusively.
-      requestMediaPermissions().then(granted => {
-        if (!granted) return;
-        setFetchingMedia(true);
-        fetchAllMedia((currentAssets, _hasNext, totalCount) => {
-          setAllAssets(currentAssets);
-          setMediaFetchProgress(currentAssets.length, totalCount);
-        })
-          .then(assets => { setAllAssets(assets); })
-          .catch(err => console.warn('Background refresh failed', err))
-          .finally(() => setFetchingMedia(false));
-      });
       return;
     }
     try {
@@ -115,9 +103,13 @@ export default function HomeScreen({ navigation }: Props) {
       // The in-page progress card communicates any ongoing background fetch.
       setLoading(false);
       setFetchingMedia(true);
-      const assets = await fetchAllMedia((currentAssets, _hasNext, totalCount) => {
-        setAllAssets(currentAssets);
-        setMediaFetchProgress(currentAssets.length, totalCount);
+      const assets = await fetchAllMedia((_currentAssets, _hasNext, totalCount) => {
+        // Only update the lightweight progress counter — never setAllAssets here.
+        // Calling setAllAssets on every page serializes a growing multi-MB array
+        // to AsyncStorage on each write, causing JS thread stalls ("not responding")
+        // and making the grid show only the most-recent months until the full
+        // fetch completes. allAssets is committed once, atomically, below.
+        setMediaFetchProgress(_currentAssets.length, totalCount);
       });
       setAllAssets(assets);
     } catch (err: any) {
@@ -223,6 +215,13 @@ export default function HomeScreen({ navigation }: Props) {
         </View>
         <View style={{ flexDirection: 'row', gap: 12 }}>
           <TouchableOpacity
+            style={[styles.trashButton, isFetchingMedia && { opacity: 0.5 }]}
+            onPress={() => loadMedia(true)}
+            disabled={isFetchingMedia}
+          >
+            <Ionicons name="refresh-outline" size={24} color="#0F172A" />
+          </TouchableOpacity>
+          <TouchableOpacity
             style={styles.trashButton}
             onPress={() => navigation.navigate('Trash', {})}
           >
@@ -233,7 +232,10 @@ export default function HomeScreen({ navigation }: Props) {
               </View>
             )}
           </TouchableOpacity>
-          <TouchableOpacity style={styles.trashButton}>
+          <TouchableOpacity
+            style={styles.trashButton}
+            onPress={() => Alert.alert('Memory Flick', 'Version 0.3', [{ text: 'OK' }])}
+          >
             <Ionicons name="settings-outline" size={24} color="#0F172A" />
           </TouchableOpacity>
         </View>

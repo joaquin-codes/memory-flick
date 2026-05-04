@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import {
   View, Text, StyleSheet, TouchableOpacity, Animated,
   PanResponder, Dimensions, FlatList, Modal, Pressable,
+  ActivityIndicator,
 } from 'react-native';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { Ionicons } from '@expo/vector-icons';
@@ -36,6 +37,12 @@ export default function SwipeScreen({ route, navigation }: Props) {
   // dimension-based estimate while the real value is being fetched.
   const [realSizes, setRealSizes] = useState<Record<string, number>>({});
 
+  // Loading state for the current card. Flips to true whenever we move to
+  // a new asset, and back to false once the image/video reports it has
+  // finished loading. Drives the spinner overlay so older months — which
+  // haven't been pre-cached — don't display as solid white/black cards.
+  const [cardLoading, setCardLoading] = useState(false);
+
   const flatListRef = useRef<FlatList>(null);
   const prevFilter = useRef(filter);
   const prevSort = useRef(sortBySize);
@@ -56,6 +63,14 @@ export default function SwipeScreen({ route, navigation }: Props) {
   // while a swipe-off animation is already in flight. Without this, rapid
   // taps corrupt the shared Animated position and leave the card stack blank.
   const isAnimatingRef = useRef(false);
+
+  // Ref-based timer for the card-loading debounce (Bug 2). Stored in a ref
+  // so onLoad/onError callbacks can cancel it without needing a state update.
+  const cardLoadingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Prevents overlapping replaceAsync calls to ExoPlayer. A second call
+  // before the first resolves can corrupt native player state and crash.
+  const videoReplaceInFlightRef = useRef(false);
 
   const {
     keptItems, pendingDeletion, keepItem,
@@ -190,14 +205,25 @@ export default function SwipeScreen({ route, navigation }: Props) {
       hasSwipedRef.current = true;
     }
 
-    // Reset the shared Animated position back to centre, then advance the
-    // index on the next animation frame. The one-frame delay lets the
-    // native driver process the reset before the new card mounts so that
-    // it doesn't briefly appear at the off-screen co-ordinate.
-    position.setValue({ x: 0, y: 0 });
-    requestAnimationFrame(() => {
-      if (item) setCurrentIndex(p => p + 1);
+    // Reset the position through the native animation pipeline (duration:0)
+    // rather than setValue + requestAnimationFrame. setValue with useNativeDriver
+    // is asynchronous — the native thread may not have applied it by the time
+    // rAF fires, so the new card can briefly mount off-screen (the blank card
+    // bug). A duration:0 Animated.timing goes through the same commit path as
+    // the fly-off and its callback fires only after the native thread has
+    // applied the reset, guaranteeing the card mounts at (0,0).
+    Animated.timing(position, {
+      toValue: { x: 0, y: 0 },
+      duration: 0,
+      useNativeDriver: true,
+    }).start(() => {
       isAnimatingRef.current = false;
+      if (!item) return;
+      // Defensive: only advance to idx+1 if the index is still where the
+      // swipe started. If the user tapped a carousel preview during the
+      // 220ms swipe animation, prev will be that tapped index — leave it
+      // alone so we don't clobber the user's selection.
+      setCurrentIndex(prev => prev === idx ? prev + 1 : prev);
     });
   };
 
@@ -251,30 +277,88 @@ export default function SwipeScreen({ route, navigation }: Props) {
   useEffect(() => {
     if (!videoPlayer) return;
     if (currentIsVideo && currentAsset?.uri) {
+      // Skip if a replaceAsync is still in flight. Overlapping calls to
+      // ExoPlayer can corrupt native player state and crash the app. A
+      // skipped video (user swiped past it fast) is far safer than a crash.
+      if (videoReplaceInFlightRef.current) return;
       const p: any = videoPlayer;
+      let cancelled = false;
+      videoReplaceInFlightRef.current = true;
       try {
         if (typeof p.replaceAsync === 'function') {
-          // Must await before calling play() — firing play() on a player
-          // that hasn't finished loading the new source causes an unhandled
-          // rejection that can crash the JS thread.
           p.replaceAsync(currentAsset.uri)
-            .then(() => { try { videoPlayer.play(); } catch {} })
-            .catch((e: any) => {
-              console.warn('video replaceAsync failed', e);
-              // Attempt synchronous fallback so the card isn't permanently blank.
+            .then(() => {
+              videoReplaceInFlightRef.current = false;
+              if (cancelled) return;
               try { videoPlayer.play(); } catch {}
+              setCardLoading(false);
+            })
+            .catch((e: any) => {
+              videoReplaceInFlightRef.current = false;
+              console.warn('video replaceAsync failed', e);
+              try { videoPlayer.play(); } catch {}
+              setCardLoading(false);
             });
         } else if (typeof p.replace === 'function') {
           p.replace(currentAsset.uri);
           videoPlayer.play();
+          videoReplaceInFlightRef.current = false;
+          setCardLoading(false);
         }
       } catch (e) {
+        videoReplaceInFlightRef.current = false;
         console.warn('video player swap failed', e);
+        setCardLoading(false);
       }
+      return () => { cancelled = true; };
     } else {
+      videoReplaceInFlightRef.current = false;
       try { videoPlayer.pause(); } catch {}
     }
   }, [currentIsVideo, currentAsset?.uri, videoPlayer]);
+
+  /* ── card loading state ──
+   * Gate the spinner behind an 80ms debounce. expo-image fires onLoad in
+   * under one frame for memory/disk-cached assets — those never show the
+   * spinner because onLoad cancels the timer before it fires. Only assets
+   * that genuinely need decoding (first visit to an old month, new photos)
+   * will trigger the spinner. A 4-second safety timeout prevents it from
+   * hanging on assets whose onLoad never fires (e.g. load errors). */
+  useEffect(() => {
+    if (cardLoadingTimerRef.current) clearTimeout(cardLoadingTimerRef.current);
+    if (!currentAsset) {
+      setCardLoading(false);
+      return;
+    }
+    cardLoadingTimerRef.current = setTimeout(() => {
+      setCardLoading(true);
+      cardLoadingTimerRef.current = setTimeout(() => setCardLoading(false), 4000);
+    }, 80);
+    return () => {
+      if (cardLoadingTimerRef.current) clearTimeout(cardLoadingTimerRef.current);
+    };
+  }, [currentAsset?.id]);
+
+  /* ── carousel tap handler ──
+   * Cancels any in-flight swipe animation cleanly before jumping to the
+   * tapped card. Without this, tapping during the 220ms fly-off would
+   * leave the new card mounted at the swipe's animating position and
+   * the index race could land on the wrong asset. */
+  const handleCarouselTap = (i: number) => {
+    if (isAnimatingRef.current) {
+      // stopAnimation's callback fires after the native thread has halted —
+      // only then is it safe to reset. Same duration:0 trick as onSwipeComplete.
+      position.stopAnimation(() => {
+        Animated.timing(position, { toValue: { x: 0, y: 0 }, duration: 0, useNativeDriver: true })
+          .start(() => {
+            isAnimatingRef.current = false;
+            setCurrentIndex(i);
+          });
+      });
+    } else {
+      setCurrentIndex(i);
+    }
+  };
 
   /* ── prefetch upcoming photo cards ──
    * Warm expo-image's disk cache for the next few cards so swipes
@@ -334,6 +418,17 @@ export default function SwipeScreen({ route, navigation }: Props) {
         transition={150}
         cachePolicy="memory-disk"
         recyclingKey={asset.id}
+        // Cancel the 80ms debounce timer and clear the spinner on load/error.
+        // Only the active card drives screen-level cardLoading — the behind
+        // card loading should not dismiss the spinner for the front card.
+        onLoad={active ? () => {
+          if (cardLoadingTimerRef.current) clearTimeout(cardLoadingTimerRef.current);
+          setCardLoading(false);
+        } : undefined}
+        onError={active ? () => {
+          if (cardLoadingTimerRef.current) clearTimeout(cardLoadingTimerRef.current);
+          setCardLoading(false);
+        } : undefined}
       />
     );
   };
@@ -369,7 +464,7 @@ export default function SwipeScreen({ route, navigation }: Props) {
 
     return (
       <TouchableOpacity
-        onPress={() => setCurrentIndex(i)}
+        onPress={() => handleCarouselTap(i)}
         activeOpacity={0.8}
         style={[styles.carouselItem, isCurrent && styles.carouselItemActive, (isKept || isTrashed) && { opacity: 0.65 }]}
       >
@@ -586,6 +681,17 @@ export default function SwipeScreen({ route, navigation }: Props) {
                 {...panResponder.panHandlers}
               >
                 {renderMedia(currentAsset, true)}
+
+                {/* Loading overlay — covers the card while the active asset
+                    decodes. Prevents the brief white/black flash on older
+                    months that haven't been pre-cached yet. */}
+                {cardLoading && (
+                  <View style={styles.cardLoadingOverlay} pointerEvents="none">
+                    <ActivityIndicator size="large" color="#FDE047" />
+                    <Text style={styles.cardLoadingText}>Loading…</Text>
+                  </View>
+                )}
+
                 {renderStickers()}
 
                 {/* Reviewed badge — top-right corner, mirrors the action that already happened */}
@@ -649,7 +755,16 @@ export default function SwipeScreen({ route, navigation }: Props) {
             </TouchableOpacity>
             <TouchableOpacity
               style={[styles.actionBtn, styles.actionSkip]}
-              onPress={() => setCurrentIndex(p => Math.min(p + 1, assets.length - 1))}
+              onPress={() => {
+                // Skip without recording a decision. Cancel any in-flight
+                // swipe animation so we don't race with onSwipeComplete.
+                if (isAnimatingRef.current) {
+                  position.stopAnimation();
+                  position.setValue({ x: 0, y: 0 });
+                  isAnimatingRef.current = false;
+                }
+                setCurrentIndex(p => Math.min(p + 1, assets.length - 1));
+              }}
             >
               <Ionicons name="play-forward" size={22} color="#0F172A" />
             </TouchableOpacity>
@@ -775,6 +890,21 @@ const styles = StyleSheet.create({
   },
   videoPlaceholder: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#E2E8F0' },
   videoPlaceholderText: { color: '#475569', marginTop: 8, fontWeight: '700' },
+
+  /* Card loading overlay (shown while the active asset decodes) */
+  cardLoadingOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(15,23,42,0.85)',
+  },
+  cardLoadingText: {
+    color: '#FDE047',
+    fontSize: 13,
+    fontWeight: '800',
+    marginTop: 12,
+    letterSpacing: 1,
+  },
 
   /* Stickers (drag-driven) */
   stickerKeep: {
